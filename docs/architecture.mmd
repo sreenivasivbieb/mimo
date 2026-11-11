@@ -8,12 +8,12 @@ flowchart LR
     runs["<b>run registry</b><br/>idempotent turn IDs<br/>new message aborts the old run"]
     turngraph["<b>graph.ts</b><br/>LangGraph turn graph"]
     logic["<b>time.ts · recall.ts · guards.ts</b><br/>dates, memory, checks<br/>(plain code, no model)"]
-    models["<b>models.ts</b><br/>Groq adapter + key rotator<br/>token budget · Anthropic optional"]
+    models["<b>models.ts</b><br/>Anthropic adapter<br/>effort per tier · refusal fallback"]
     search["<b>search.ts</b><br/>Tavily (Brave optional)<br/>10-min cache, retries"]
     store["<b>store.ts</b><br/>PgStore"]
   end
 
-  groq[("Groq API<br/>gpt-oss-20b · gpt-oss-120b")]
+  claude[("Anthropic API<br/>claude-opus-5-5")]
   tavily[("Tavily API")]
   pg[("Postgres · Docker<br/>turns · claims")]
 
@@ -21,7 +21,7 @@ flowchart LR
   http -- "status · sources · token · note · done" --> ui
   http --> runs --> turngraph
   turngraph --> logic
-  turngraph --> models --> groq
+  turngraph --> models --> claude
   turngraph --> search --> tavily
   turngraph --> store --> pg
 
@@ -30,4 +30,4 @@ flowchart LR
   classDef data fill:#ffedd5,stroke:#ea580c,color:#7c2d12
   class http,runs,turngraph,logic,search,store code
   class models model
-  class groq,tavily,pg data
+  class claude,tavily,pg data

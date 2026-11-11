@@ -49,7 +49,7 @@ export function filterByWindow<T extends { pageDate?: string }>(items: T[], w: D
 
 const TAG = /\[((?:[ST]\d+)(?:\s*[,;]\s*[ST]\d+)*)\]/g;
 
-/** gpt-oss cites as 【S1】, 【S1†L4-L9】 or (S1, S6); rewrite those to [S1] so one resolver handles every model. */
+/** Models sometimes cite as 【S1】, 【S1†L4-L9】 or (S1, S6); rewrite those to [S1] so one resolver handles every form. */
 export function normalizeTags(text: string): string {
   return text
     .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '') // zero-width characters inside [​S3]

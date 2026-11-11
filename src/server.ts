@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { runTurn, type Deps } from './graph.js';
-import { modelFromEnv, providerFromEnv } from './models.js';
+import { modelFromEnv } from './models.js';
 import { searchFromEnv } from './search.js';
 import { storeFromEnv, type Store } from './store.js';
 import { localDay, safeZone } from './time.js';
@@ -140,7 +140,7 @@ export function createApp(deps: Omit<Deps, 'emit' | 'signal'> & { store: Store }
 
 function friendly(err: unknown): string {
   const msg = (err as Error)?.message ?? String(err);
-  if (/api[_ -]?key|authentication|401|credential/i.test(msg)) return `The model provider rejected the credentials. Check ${providerFromEnv() === 'groq' ? 'GROQ_API_KEY' : 'ANTHROPIC_API_KEY'} in .env.`;
+  if (/api[_ -]?key|authentication|401|credential/i.test(msg)) return 'The model provider rejected the credentials. Check ANTHROPIC_API_KEY in .env.';
   if (/429|rate/i.test(msg)) return 'The model provider is rate-limiting us. Please try again in a moment.';
   if (/timeout|timed out|ETIMEDOUT|ECONN/i.test(msg)) return 'A provider took too long to respond. Please try again.';
   return `Something went wrong: ${msg.slice(0, 200)}`;
@@ -167,9 +167,7 @@ function json(res: ServerResponse, status: number, body: unknown) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const port = Number(process.env.PORT ?? 3000);
   const search = searchFromEnv();
-  const provider = providerFromEnv();
-  const keyVar = provider === 'groq' ? 'GROQ_API_KEY' : 'ANTHROPIC_API_KEY';
-  if (!process.env[keyVar]) console.warn(`[mimo] ${keyVar} is not set — add it to .env.`);
+  if (!process.env.ANTHROPIC_API_KEY) console.warn('[mimo] ANTHROPIC_API_KEY is not set — add it to .env (or sign in with `ant auth login`).');
   if (search.name === 'none') console.warn('[mimo] No search key — set TAVILY_API_KEY (or BRAVE_API_KEY) in .env.');
     let store: Store;
   try {
@@ -181,6 +179,6 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     process.exit(1);
   }
   createApp({ model: modelFromEnv(), search, store, log: (l) => console.log(l) }).listen(port, () => {
-    console.log(`[mimo] http://localhost:${port}  (db: postgres, search: ${search.name}, models: ${provider}${process.env.MODEL_MAIN ? ` ${process.env.MODEL_MAIN}` : ''})`);
+    console.log(`[mimo] http://localhost:${port}  (db: postgres, search: ${search.name}, model: ${process.env.MODEL_MAIN || 'claude-opus-5-5'})`);
   });
 }

@@ -13,7 +13,7 @@ The model writes the answers. **Code** works out what "Monday" means in your tim
 ## Quick start
 
 ```bash
-cp .env.example .env     # add GROQ_API_KEY (or several in GROQ_API_KEYS) and TAVILY_API_KEY
+cp .env.example .env     # add ANTHROPIC_API_KEY and TAVILY_API_KEY
 npm install
 npm run db:up            # Postgres in Docker on localhost:5433 — conversation history lives here
 npm run dev              # http://localhost:3000
@@ -40,7 +40,41 @@ The seeded prices are illustrative demo values, so a recheck reports what today'
 
 ## Architecture
 
-![Architecture](docs/architecture.png)
+```mermaid
+flowchart LR
+  subgraph browser["Browser"]
+    ui["<b>public/index.html</b><br/>chat page · sends time zone + locale<br/>renders citations and sources"]
+  end
+
+  subgraph server["Node server · npm run dev"]
+    http["<b>server.ts</b><br/>POST /api/chat → SSE stream<br/>GET /api/history"]
+    runs["<b>run registry</b><br/>idempotent turn IDs<br/>new message aborts the old run"]
+    turngraph["<b>graph.ts</b><br/>LangGraph turn graph"]
+    logic["<b>time.ts · recall.ts · guards.ts</b><br/>dates, memory, checks<br/>(plain code, no model)"]
+    models["<b>models.ts</b><br/>Anthropic adapter<br/>effort per tier · refusal fallback"]
+    search["<b>search.ts</b><br/>Tavily (Brave optional)<br/>10-min cache, retries"]
+    store["<b>store.ts</b><br/>PgStore"]
+  end
+
+  claude[("Anthropic API<br/>claude-opus-5-5")]
+  tavily[("Tavily API")]
+  pg[("Postgres · Docker<br/>turns · claims")]
+
+  ui -- "message + turn ID" --> http
+  http -- "status · sources · token · note · done" --> ui
+  http --> runs --> turngraph
+  turngraph --> logic
+  turngraph --> models --> claude
+  turngraph --> search --> tavily
+  turngraph --> store --> pg
+
+  classDef code fill:#f4f4f5,stroke:#71717a,color:#18181b
+  classDef model fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+  classDef data fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+  class http,runs,turngraph,logic,search,store code
+  class models model
+  class claude,tavily,pg data
+```
 
 | Part | File | What it does |
 |---|---|---|
@@ -50,7 +84,7 @@ The seeded prices are illustrative demo values, so a recheck reports what today'
 | Time | `src/time.ts` | Turns date phrases into a date window and an ordered list of candidate days, always in the user's own time zone. |
 | Recall | `src/recall.ts` | Finds earlier turns **across all of this user's chats**: exact lookup by day, or keyword (TF-IDF) ranking within a date window. Tries every candidate day first ("last Tuesday" → two Tuesdays), then widens the window up to three times when the match is weak. |
 | Guards | `src/guards.ts` | The "no record" reply, citation links, the number check, the date-window filter, and verdict checks with the table and bottom line. |
-| Models | `src/models.ts` | The Groq adapter (default) with key rotation and a token budget. An Anthropic adapter is available as an option. |
+| Models | `src/models.ts` | The Anthropic adapter: `claude-opus-5-5`, effort low / medium / high per tier, structured outputs, a streamed tool loop, and server-side refusal fallback. |
 | Search | `src/search.ts` | The single `web_search` tool, backed by Tavily (Brave optional), with a 10-minute cache, timeouts and retries. |
 | Prompts | `src/prompts.ts` | The router, writer, verdict and extraction prompts, and the context blocks that code builds for each turn. |
 | Store | `src/store.ts` | Postgres (`turns`, `claims`) behind a `Store` interface. An in-memory version with the same contract is used for tests. |
@@ -88,12 +122,9 @@ Diagram sources are `docs/workflow.mmd` and `docs/architecture.mmd` (Mermaid).
 | Variable | Purpose |
 |---|---|
 | `MIMO_DATABASE_URL` | Postgres for history. The default points at the Docker container (`postgres://mimo:mimo@localhost:5433/mimo`). It is deliberately not `DATABASE_URL`, so a value exported for another project is never used. |
-| `MODEL_PROVIDER` | `groq` (default) or `anthropic` |
-| `GROQ_API_KEY` / `GROQ_API_KEYS` | One key, or several comma-separated. Requests rotate across them and skip a key while it is rate-limited. |
-| `GROQ_MAX_INPUT_TOKENS` | Size limit per Groq request, default 5000. Requests are trimmed to fit the free tier's tokens-per-minute limit. |
-| `MODEL_FAST` / `MODEL_MAIN` / `MODEL_DEEP` | Optional model per tier. Groq defaults: `openai/gpt-oss-20b` for fast, `openai/gpt-oss-120b` for main and deep. |
+| `ANTHROPIC_API_KEY` | Claude API key (an `ant auth login` profile also works) |
+| `MODEL_FAST` / `MODEL_MAIN` / `MODEL_DEEP` | Optional model per tier. Default `claude-opus-5-5` for all three. |
 | `TAVILY_API_KEY` (or `BRAVE_API_KEY`) | Web search |
-| `ANTHROPIC_API_KEY` | Only when `MODEL_PROVIDER=anthropic` |
 | `AGENT_TZ` | Fallback time zone if the browser sends none |
 | `PORT` | HTTP port, default 3000 |
 | `LANGSMITH_TRACING` / `LANGSMITH_API_KEY` | Optional LangSmith tracing of graph nodes (read by LangChain itself) |
@@ -106,7 +137,7 @@ Diagram sources are `docs/workflow.mmd` and `docs/architecture.mmd` (Mermaid).
 |---|---|
 | `npm run dev` | Start the server and chat page |
 | `npm run db:up` / `npm run db:down` | Start or stop the Postgres container (data stays in the `mimo-pg` volume) |
-| `npm test` | 102 tests: date rules, recall, guards, graph routes, server reliability, Groq adapter. Uses a fake model and fake search, so no keys are needed. The store contract also runs against Postgres when `MIMO_DATABASE_URL` is set (it is read from `.env`), so run `npm run db:up` first; with no `MIMO_DATABASE_URL` those 5 tests are skipped. |
+| `npm test` | 94 tests: date rules, recall, guards, graph routes, server reliability, store contract. Uses a fake model and fake search, so no keys are needed. The store contract also runs against Postgres when `MIMO_DATABASE_URL` is set (it is read from `.env`), so run `npm run db:up` first; with no `MIMO_DATABASE_URL` those 5 tests are skipped. |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run eval` | Scenario suites against the real model and search, 3 repeats each. Reports pass rate and median / p90 turn time. |
 | `npm run demo:seed` | Seed the demo conversation |
@@ -125,7 +156,7 @@ src/
   time.ts      time zones, date-phrase rules, windows
   recall.ts    day lookup, topic ranking, widen loop
   guards.ts    abstention, citations, numbers, date window, verdicts
-  models.ts    Groq (key rotator, token budget) and Anthropic adapters
+  models.ts    Anthropic adapter (Claude)
   search.ts    SearchProvider: Tavily, Brave, cache
   prompts.ts   prompts and per-turn context blocks
   store.ts     Store interface: Postgres + in-memory

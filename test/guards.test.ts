@@ -14,7 +14,7 @@ describe('CitationResolver', () => {
     expect([...r.unknown]).toEqual(['S9']);
   });
 
-  it('accepts gpt-oss style 【S1†L4-L9】 citations, even split across tokens', () => {
+  it('accepts 【S1†L4-L9】-style citations, even split across tokens', () => {
     const r = new CitationResolver(new Map([['S1', src('S1', '')], ['S2', src('S2', '')]]), new Map());
     let out = '';
     for (const d of ['Node is v26 【', 'S1†L4', '-L9】 and 【S1, S2】.']) out += r.push(d);
