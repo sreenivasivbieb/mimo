@@ -15,7 +15,6 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "eval": "tsx eval/run.ts",
-    "demo:seed": "tsx eval/seed.ts",
     "brief": "tsx eval/brief.ts"
   },
   "dependencies": {

@@ -23,18 +23,12 @@ Requirements: Node 20+ and Docker. There is no build step and there are no nativ
 
 
 
-```bash
-npm run demo:seed        # a sample week for user "demo", spread over three chats
-```
+The first start creates the tables automatically. To try the time and memory features, chat with Mimo for a bit, then ask:
 
-Then open <http://localhost:3000/?user=demo&conv=demo>, press **New chat**, and ask:
-
-- "What did we discuss in our previous conversation?" — Mimo lists the days and chats it has and asks which day. Reply "3 November".
-- "Did we discuss Obsidian?" — the answer links into the chat where it came up.
-- "Has anything changed with the CRM prices I asked about on 3 November?" — a recheck of claims made in another chat.
-- "What did I ask on 4 November?" — a day with no messages, so you get an honest "no record" and the days that do have messages.
-
-The seeded prices are illustrative demo values, so a recheck reports what today's web says about them.
+- "What did we discuss in our previous conversation?" — Mimo lists the days and chats it has and asks which day.
+- "Did we discuss <something you asked about>?" — the answer links into the chat where it came up.
+- "Has anything changed with <that topic> since <the day you asked>?" — a recheck of the claims Mimo made then.
+- "What did I ask on <a day with no messages>?" — an honest "no record", plus the days that do have messages.
 
 ---
 
@@ -140,7 +134,6 @@ Diagram sources are `docs/workflow.mmd` and `docs/architecture.mmd` (Mermaid).
 | `npm test` | 94 tests: date rules, recall, guards, graph routes, server reliability, store contract. Uses a fake model and fake search, so no keys are needed. The store contract also runs against Postgres when `MIMO_DATABASE_URL` is set (it is read from `.env`), so run `npm run db:up` first; with no `MIMO_DATABASE_URL` those 5 tests are skipped. |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run eval` | Scenario suites against the real model and search, 3 repeats each. Reports pass rate and median / p90 turn time. |
-| `npm run demo:seed` | Seed the demo conversation |
 | `npm run brief` | Seed three earlier chats for user `brief` in Postgres, then ask the three sample questions from new chats against the real model and search, printing each answer (needs keys) |
 
 Inspect the data directly with `docker exec -it mimo-postgres psql -U mimo -d mimo`.
@@ -164,5 +157,5 @@ src/
 public/        chat page
 docs/          diagrams (PNG + Mermaid source)
 test/          unit, graph, reliability and adapter tests
-eval/          scenario runner, demo seed, sample-question run (brief.ts)
+eval/          scenario runner, sample history (seed.ts), sample-question run (brief.ts)
 ```

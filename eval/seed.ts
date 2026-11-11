@@ -1,8 +1,7 @@
-// npm run demo:seed — writes a sample week of history for user "demo" in Postgres, spread over three chats
-// (so recall across conversations can be tried). Open http://localhost:3000/?user=demo to chat on top of it.
-// The prices below are illustrative demo values, not real quotes; a recheck will compare them with today's web.
-import { claimId, storeFromEnv, type Store } from '../src/store.js';
-import { addDays, localDay, safeZone } from '../src/time.js';
+// A sample week of history spread over three chats, used by `npm run eval` (in-memory store).
+// The prices below are illustrative values, not real quotes; a recheck will compare them with today's web.
+import { claimId, type Store } from '../src/store.js';
+import { addDays } from '../src/time.js';
 import type { Claim, Turn } from '../src/types.js';
 
 export async function seed(store: Store, convId: string, today: string, tz = 'UTC', userId = convId) {
@@ -37,15 +36,4 @@ export async function seed(store: Store, convId: string, today: string, tz = 'UT
   for (const t of turns) await store.putTurn(t);
   await store.upsertClaims(convId, claims);
   return { turns, claims };
-}
-
-if (process.argv[1]?.endsWith('seed.ts')) {
-  try {
-    process.loadEnvFile('.env');
-  } catch {}
-  const store = storeFromEnv();
-  const tz = safeZone(process.env.AGENT_TZ ?? Intl.DateTimeFormat().resolvedOptions().timeZone);
-  const { turns } = await seed(store, 'demo', localDay(new Date(), tz), tz);
-  await store.close?.();
-  console.log(`Seeded ${turns.length} turns for user "demo" in 3 chats (${turns.map((t) => t.localDay).join(', ')}). Open http://localhost:3000/?user=demo&conv=demo`);
 }
