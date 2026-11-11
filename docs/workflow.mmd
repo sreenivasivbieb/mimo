@@ -2,7 +2,7 @@ flowchart TD
   msg(["User message<br/>+ turn ID · time zone · locale"]) --> ingest
 
   ingest["<b>ingest</b> · code<br/>server timestamp + sequence<br/>user's local calendar day"] --> resolve
-  resolve["<b>resolve_dates</b> · code<br/>'since Monday' · '3/11' · 'last Tuesday'<br/>→ date window + candidate days"] --> recall
+  resolve["<b>resolve_dates</b><br/>fast model copies the time words,<br/>rules turn them into a date window<br/>(rules alone if the model fails)"] --> recall
   recall["<b>recall</b> · code<br/>reads this user's earlier chats (Postgres)<br/>exact day lookup or topic ranking<br/>widens the window up to 3×"] --> router
 
   router{"<b>router</b><br/>regex pre-checks,<br/>else fast model"}
@@ -29,6 +29,6 @@ flowchart TD
   classDef code fill:#f4f4f5,stroke:#71717a,color:#18181b
   classDef model fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
   classDef edge fill:#ecfdf5,stroke:#059669,color:#064e3b
-  class ingest,resolve,recall,guards,store,gate,fan,norecord,when,whichday code
-  class router,one,many,verdicts,synth,extract model
+  class ingest,recall,guards,store,gate,fan,norecord,when,whichday code
+  class resolve,router,one,many,verdicts,synth,extract model
   class msg,done edge

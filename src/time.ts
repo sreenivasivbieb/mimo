@@ -12,6 +12,16 @@ const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 
 const MONTH_RE = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
 const WEEKDAY_RE = '(sunday|monday|tuesday|wednesday|thursday|friday|saturday)';
 
+/**
+ * Cheap pre-check: could this message refer to a time at all? Used to skip the model that reads time
+ * phrases when there is nothing to read ("whats tavily"). Deliberately generous; the model has the final say.
+ */
+const TIME_CUE = new RegExp(
+  `\\b\\d{1,2}[/.]\\d{1,2}\\b|\\b\\d{4}-\\d{2}-\\d{2}\\b|\\b\\d{1,2}(?:st|nd|rd|th)\\b|\\b(?:${WEEKDAYS.join('|')}|yesterday|today|tonight|tomorrow|morning|afternoon|evening|night|ago|since|last|before|earlier|previous|previously|recent|recently|weeks?|weekends?|months?|years?|quarter)\\b|\\b${MONTH_RE}\\b`,
+  'i',
+);
+export const mayMentionTime = (text: string) => TIME_CUE.test(text);
+
 /** Validate an IANA zone; fall back when the browser sent nothing usable. */
 export function safeZone(tz: string | undefined, fallback = process.env.AGENT_TZ || 'UTC'): string {
   for (const z of [tz, fallback, 'UTC']) {
@@ -99,6 +109,8 @@ const exact = (day: string, extra: Partial<Resolved> = {}): Resolved => ({ windo
  *  - "last Tuesday" keeps two candidates: the most recent one, then the week before
  *  - "3/11" uses the locale's order, states the assumption, keeps the other reading as a candidate
  *  - vague phrases get a wide window; event-anchored phrases are not guessed
+ * In the app a fast model first copies out the words that name the time, and only those words come
+ * here (so "monday.com" or "after 3.11" never reach it); on any model failure this runs on the whole message.
  */
 export function resolveDates(text: string, today: string, locale = 'en-US'): Resolved {
   const t = ` ${text.toLowerCase().replace(/[’']/g, "'").replace(/\s+/g, ' ')} `;
@@ -154,6 +166,15 @@ export function resolveDates(text: string, today: string, locale = 'en-US'): Res
   if (/\b(the )?day before yesterday\b/.test(t)) return exact(addDays(today, -2));
   if (/\byesterday\b/.test(t)) return exact(addDays(today, -1));
   if (/\b(today|this morning|this afternoon|this evening|tonight|earlier today)\b/.test(t)) return exact(today);
+  if ((m = t.match(/\b(\d+|a|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve) months? ago\b/))) {
+    const words: Record<string, number> = { a: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12 };
+    const n = words[m[1]] ?? +m[1];
+    if (n >= 1) {
+      // Calendar months differ in length, so this is an approximate window around 30 days per month, flagged vague.
+      const mid = addDays(today, -30 * n);
+      return { window: range(addDays(mid, -7), addDays(mid, 7), `about ${n} month${n > 1 ? 's' : ''} ago`), candidates: [mid], vague: true, eventAnchored: false };
+    }
+  }
   if ((m = t.match(/\b(\d+|a|one|two|three|four|five|six) (day|week)s? ago\b/))) {
     const words: Record<string, number> = { a: 1, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6 };
     const n = words[m[1]] ?? +m[1];
@@ -166,6 +187,12 @@ export function resolveDates(text: string, today: string, locale = 'en-US'): Res
   }
   if (/\blast week\b/.test(t)) {
     return { window: range(addDays(today, -13), addDays(today, -7), 'last week'), candidates: [], vague: false, eventAnchored: false };
+  }
+  if (/\blast weekend\b/.test(t)) {
+    // The most recent finished Saturday + Sunday; asked on a Sunday, the weekend before this one.
+    let sat = pastWeekday(today, 6, true);
+    if (weekdayOf(today) === 0) sat = addDays(sat, -7);
+    return { window: range(sat, addDays(sat, 1), 'last weekend'), candidates: [], vague: false, eventAnchored: false };
   }
   if (/\bthis month\b/.test(t)) {
     const w = monthWindow(y, mo);

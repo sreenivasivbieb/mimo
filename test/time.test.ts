@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { localDay, relativeAge, resolveDates } from '../src/time.js';
+import { localDay, mayMentionTime, relativeAge, resolveDates } from '../src/time.js';
 
 const WED = '2026-11-11'; // a Wednesday
 
@@ -25,6 +25,11 @@ describe('resolveDates', () => {
     ['next Friday', WED, '2026-11-13..2026-11-13'],
     ['on 2026-10-02', WED, '2026-10-02..2026-10-02'],
     ['What did I ask you on 3 November? Is your answer still correct today?', WED, '2026-11-03..2026-11-03'],
+    ['what did I ask a month ago?', WED, '2026-10-05..2026-10-19'], // about 30 days back, ±7
+    ['what did I ask three months ago?', WED, '2026-08-06..2026-08-20'], // 90 days back, ±7
+    ['what did we discuss last weekend?', WED, '2026-11-07..2026-11-08'],
+    ['what did we discuss last weekend?', '2026-11-15', '2026-11-07..2026-11-08'], // asked on a Sunday: the weekend before this one
+    ['what did we discuss last weekend?', '2026-11-14', '2026-11-07..2026-11-08'], // asked on a Saturday
     ['we offer 24/7 support', WED, null],
     ['the sun is out and I sat down', WED, null],
     ['what is the price of HubSpot?', WED, null],
@@ -78,5 +83,12 @@ describe('relativeAge', () => {
     expect(relativeAge('2026-11-10', WED)).toBe('yesterday');
     expect(relativeAge('2026-11-03', WED)).toBe('8 days ago');
     expect(relativeAge('2026-10-21', WED)).toBe('3 weeks ago');
+  });
+});
+
+describe('mayMentionTime (the gate before the time model)', () => {
+  it('lets time-like messages through and skips plain ones', () => {
+    for (const q of ['what did I ask on Monday?', 'since 3/11', 'in August', '3rd of May', 'a month ago', 'last time', 'any news before the launch', 'what about 2026-11-03']) expect(mayMentionTime(q), q).toBe(true);
+    for (const q of ['whats tavily', 'price of iphone 15', 'who won ipl 2025', 'hello']) expect(mayMentionTime(q), q).toBe(false);
   });
 });

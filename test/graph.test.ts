@@ -13,8 +13,8 @@ function setup(model: FakeModel, search = new FakeSearch()) {
   const ask = async (text: string, id = `q${Math.random().toString(16).slice(2, 8)}`) => {
     const t: Turn = { ...turn({ id, user: text, localDay: '', ts: NOW, seq: await store.nextSeq('c1') }), assistant: undefined };
     events.length = 0;
-    await runTurn({ model, search, store, emit: (e) => events.push(e) }, { turn: t, locale: 'en-GB' });
-    return { stored: (await store.getTurn('c1', id))!, text: events.filter((e) => e.type === 'token').map((e) => (e as { text: string }).text).join(''), events: [...events] };
+    const state = await runTurn({ model, search, store, emit: (e) => events.push(e) }, { turn: t, locale: 'en-GB' });
+    return { stored: (await store.getTurn('c1', id))!, text: events.filter((e) => e.type === 'token').map((e) => (e as { text: string }).text).join(''), events: [...events], state };
   };
   return { store, ask, search };
 }
@@ -362,3 +362,92 @@ describe('memory across conversations (same user)', () => {
   });
 });
 
+describe('time: the model reads the phrase, the rules calculate it', () => {
+  const noRoute = { route: 'search' as const, entities: [], queries: [], domains: [], reason: '' };
+  const window = (r: { state: { resolved: { window: { start: string; end: string } | null } } }) => (r.state.resolved.window ? `${r.state.resolved.window.start}..${r.state.resolved.window.end}` : null);
+
+  it('a product name is not a date: "monday.com" gets no window and the search is not date-limited', async () => {
+    const model = new FakeModel({ router: noRoute, searches: ['monday.com pricing'], answer: 'ok', time: { phrase: null, about: 'none' } });
+    const { ask, search } = setup(model);
+    const r = await ask('what does monday.com cost per seat?');
+    expect(window(r)).toBeNull();
+    expect(search.queries[0].startDate).toBeUndefined();
+    expect(r.state.timeFrom).toBe('model');
+  });
+
+  it('the same message with a failing model falls back to the rules (which read "monday" as a day)', async () => {
+    const model = new FakeModel({ router: noRoute, searches: ['monday.com pricing'], answer: 'ok' }); // time not scripted: the call fails
+    const { ask } = setup(model);
+    const r = await ask('what does monday.com cost per seat?');
+    expect(r.state.timeFrom).toBe('rules');
+    expect(window(r)).toBe('2026-11-09..2026-11-09');
+  });
+
+  it('a date inside the topic does not hijack the question: only the conversation time is used', async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: { phrase: 'on 3 November', about: 'conversation' } });
+    const { ask } = setup(model);
+    const r = await ask('Has HubSpot pricing changed since the 9 November launch that I asked about on 3 November?');
+    expect(window(r)).toBe('2026-11-03..2026-11-03');
+    expect(r.state.timeAbout).toBe('conversation');
+  });
+
+  it('time about the world bounds the search but does not turn the message into a memory lookup', async () => {
+    const model = new FakeModel({ router: noRoute, searches: ['AI news'], answer: 'ok', time: { phrase: 'last week', about: 'world' } });
+    const { ask, search, store } = setup(model);
+    await store.putTurn(crmTurn());
+    const r = await ask('what happened in AI news last week?');
+    expect(window(r)).toBe('2026-10-29..2026-11-04');
+    expect(r.state.recallMode).toBeNull();
+    expect(search.queries[0].startDate).toBe('2026-10-29');
+  });
+
+  it('a phrase that is not in the message is ignored: the rules read the whole message', async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: { phrase: 'on 1 January', about: 'conversation' } });
+    const { ask } = setup(model);
+    const r = await ask('Has HubSpot pricing changed since 3 November?');
+    expect(r.state.timeFrom).toBe('rules');
+    expect(window(r)).toBe('2026-11-03..2026-11-11');
+  });
+
+  it('a phrase the rules cannot resolve falls back to the rules on the whole message', async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: { phrase: 'ages back', about: 'conversation' } });
+    const { ask } = setup(model);
+    const r = await ask('Has anything changed since ages back, or since 3 November?');
+    expect(r.state.timeFrom).toBe('rules');
+    expect(r.state.resolved.window).not.toBeNull();
+  });
+
+  it('a failing time model never breaks a recheck: the rules supply the baseline', async () => {
+    const model = new FakeModel({
+      router: { route: 'recheck', entities: ['HubSpot'], queries: [], domains: [], reason: '' }, searches: ['HubSpot pricing'], answer: 'ok',
+      verdicts: [{ claimId: claimId('a', 'HubSpot', 'starter price'), verdict: 'held', newValue: null, evidence: ['S1'], note: '' }],
+    });
+    const search = new FakeSearch(() => [{ url: 'https://hubspot.com/pricing', title: 'Pricing', excerpt: 'Starter $20 per seat', complete: true }]);
+    const { ask, store } = setup(model, search);
+    await store.putTurn(crmTurn());
+    await store.upsertClaims('c1', [{ id: claimId('a', 'HubSpot', 'starter price'), turnId: 'a', day: '2026-11-03', entity: 'HubSpot', attribute: 'starter price', value: '$20', sourceUrl: 'https://hubspot.com/pricing' }]);
+    const r = await ask('Has HubSpot pricing changed since 3 November?');
+    expect(r.state.timeFrom).toBe('rules');
+    expect(r.stored.route).toBe('recheck');
+    expect(r.state.baselineDay).toBe('2026-11-03');
+  });
+
+  it('greetings, obvious memory questions and messages with no time words never call the time model', async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: { phrase: null, about: 'none' } });
+    const { ask, store } = setup(model);
+    await store.putTurn(crmTurn());
+    for (const q of ['hello!', 'what did I ask on 3 November?', 'whats tavily']) {
+      await ask(q);
+      expect(model.calls.some((c) => c.system.startsWith('You read one chat message')), q).toBe(false);
+    }
+  });
+
+  it('the previous exchange is shown to the time model, so a short reply like "3 November" is understood', async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: { phrase: '3 November', about: 'conversation' } });
+    const { ask, store } = setup(model);
+    await store.putTurn(turn({ id: 'w', seq: 1, localDay: '2026-11-10', user: 'when did we talk about CRM?', assistant: 'Which day do you mean?', route: 'clarify' }));
+    const r = await ask('3 November');
+    expect(window(r)).toBe('2026-11-03..2026-11-03');
+    expect(model.calls.find((c) => c.system.startsWith('You read one chat message'))?.prompt).toContain('Which day do you mean?');
+  });
+});

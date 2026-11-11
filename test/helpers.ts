@@ -1,6 +1,6 @@
 // Fakes so every test runs without keys or network.
 import type { Model, Msg, ToolCall, Usage } from '../src/models.js';
-import { ExtractSchema, RouterSchema, VerdictSchema, type RouterOut } from '../src/prompts.js';
+import { ExtractSchema, RouterSchema, TimeSchema, VerdictSchema, type RouterOut, type TimeOut } from '../src/prompts.js';
 import type { SearchProvider, SearchQuery, SearchResult } from '../src/search.js';
 import type { Route, Turn } from '../src/types.js';
 
@@ -17,6 +17,8 @@ export function turn(p: Partial<Turn> & { user: string; localDay: string }): Tur
 
 type Script = {
   router?: RouterOut;
+  /** What the time-reading model returns. Left out, that call fails, so the date rules take over. */
+  time?: TimeOut;
   extract?: { entity: string; attribute: string; value: string; sourceId: string }[];
   verdicts?: { claimId: string; verdict: 'held' | 'changed' | 'corrected' | 'could-not-verify'; newValue: string | null; evidence: string[]; note: string }[];
   /** Searches the writer/searcher asks for before answering. */
@@ -31,6 +33,10 @@ export class FakeModel implements Model {
   constructor(public script: Script = {}) {}
   async structured<T>(o: { tier: string; system: string; prompt: string; schema: unknown }) {
     this.calls.push({ kind: 'structured', tier: o.tier, system: o.system.slice(0, 30), prompt: o.prompt });
+    if (o.schema === TimeSchema) {
+      if (!this.script.time) throw new Error('time reader not scripted');
+      return { value: this.script.time as T, usage: U };
+    }
     if (o.schema === RouterSchema) return { value: (this.script.router ?? { route: 'search', entities: [], queries: [], domains: [], reason: '' }) as T, usage: U };
     if (o.schema === ExtractSchema) return { value: { claims: this.script.extract ?? [] } as T, usage: U };
     if (o.schema === VerdictSchema) return { value: { rows: this.script.verdicts ?? [] } as T, usage: U };

@@ -6,6 +6,8 @@ A chat agent with one tool, **web search**, built to answer questions about time
 
 **The model writes; code decides.** Dates, memory lookups, citations, numbers and change verdicts are computed by plain code. The model receives the results as text and writes the answer around them.
 
+The one place a model sits in front of the code is reading *which words name a time*. It never produces a date; code always does the calculation, and if the model fails, plain rules take over.
+
 ## Turn flow
 
 Every message runs through one LangGraph state graph (`src/graph.ts`):
@@ -20,7 +22,7 @@ synthesize → guards → store (reply done) → extract_claims
 
 | Component | File | Role |
 |---|---|---|
-| Time | `src/time.ts` | Date phrase → date window + candidate days, in the user's time zone |
+| Time | `src/time.ts` | Date phrase → date window + candidate days, in the user's time zone (rules) |
 | Recall | `src/recall.ts` | Finds earlier turns across all of a user's chats |
 | Turn graph | `src/graph.ts` | Router, searchers, verdicts, writer, claim extraction |
 | Guards | `src/guards.ts` | No-record reply, citations, number check, verdict checks |
@@ -34,10 +36,16 @@ synthesize → guards → store (reply done) → extract_claims
 ## Key points
 
 ### Time
+- **A model reads, rules calculate.** A fast model copies the exact words that name the time ("on Monday", "since Monday", "a month ago") and says whether they are about the *conversation* or the *world*. `resolveDates` turns only those words into a window.
+  - It stops non-dates being read as dates: `monday.com`, `after 3.11`, "before a job interview", "the 3 November launch", "march" the verb.
+  - A date inside the topic no longer hijacks the question; a short reply like "3 November" is read with the previous exchange.
+  - "World" time (news from last week) bounds the search but does not trigger a memory lookup.
+- **Fallback to rules.** On a model error, words that are not in the message, or words the rules cannot resolve, the same rules run on the whole message, as before the model was added.
+- **No model call** for greetings, obvious memory questions (regex), or messages with no time words.
 - "Today" is the user's local day, from the browser's IANA time zone.
 - A bare weekday or date in the future means the past one. "Last Tuesday" keeps two candidates.
 - `3/11` follows the browser locale, states the assumption, and asks if both readings have messages.
-- "In August" = whole month; "this week" = last 7 days; vague phrases get a wide window; "before the holidays" is never guessed.
+- "In August" = whole month; "this week" = last 7 days; "last weekend" = the last finished Saturday + Sunday; "a month ago" = about 30 days back, ±7, flagged vague; vague phrases get a wide window; "before the holidays" is never guessed.
 - `24/7` and "I sat down" are not dates. Relative ages ("8 days ago") are computed in code.
 
 ### Recall
@@ -49,7 +57,7 @@ synthesize → guards → store (reply done) → extract_claims
 - No date and no topic → code lists the days and chats and asks which day.
 
 ### Router
-- Greetings and memory questions are caught by regex, with no model call.
+- Greetings and memory questions are caught by regex, with no model call (and no time-reading call either).
 - Everything else goes to a fast structured model call; `search` is the default, `clarify` is rare and never twice in a row.
 - A recheck of a recalled answer is decided by code, whatever the model says.
 
@@ -72,7 +80,7 @@ synthesize → guards → store (reply done) → extract_claims
 - A memory question with nothing recalled gets a fixed "no record" reply; a reply that describes past chats without citing a recalled turn is replaced.
 
 ### Models
-- `claude-opus-5-5` for all tiers, with effort `low` (router, extraction), `medium` (writer), `high` (recheck).
+- `claude-opus-5-5` for all tiers, with effort `low` (time reading, router, extraction), `medium` (writer), `high` (recheck).
 - Structured outputs for router, verdicts and extraction; a streamed tool loop for the writer and searchers.
 - Server-side refusal fallback; the system prompt is cached and per-turn context goes last.
 
@@ -92,10 +100,12 @@ synthesize → guards → store (reply done) → extract_claims
 
 - **Identity is per browser.** Another browser or cleared storage starts a new memory.
 - **JavaScript-rendered pricing pages** often lack prices in search text, so many price rechecks end in `could-not-verify`.
-- **English only.** Memory, recheck and date patterns are English.
+- **English only.** Memory, recheck and date patterns are English, and so are the time-reading prompt and rules.
+- **Obvious memory questions are read by rules alone** (no model, for speed), so "what did I ask yesterday about the 3 November launch?" still picks the explicit date.
+- **The time model adds one fast call** to messages that mention time (not to greetings or memory questions). If it is down, you get the rule behaviour, including its false positives.
 - **Recall thresholds** (0.12 / 0.04) are not tuned yet.
 
 ## Verification
 
-- `npm test`: 94 tests with a fake model and fake search — date rules, recall, guards, graph routes, server reliability, store contract (also against Postgres).
-- `npm run eval` and `npm run brief` run scenarios against the real model and search.
+- `npm test`: 109 tests with a fake model and fake search — date rules, recall, guards, graph routes, time reading and its fallback, server reliability, store contract (also against Postgres).
+- `npm run eval` (core, time, red-team suites) and `npm run brief` run scenarios against the real model and search.

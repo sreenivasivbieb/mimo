@@ -44,7 +44,7 @@ flowchart LR
     http["<b>server.ts</b><br/>POST /api/chat → SSE stream<br/>GET /api/history"]
     runs["<b>run registry</b><br/>idempotent turn IDs<br/>new message aborts the old run"]
     turngraph["<b>graph.ts</b><br/>LangGraph turn graph"]
-    logic["<b>time.ts · recall.ts · guards.ts</b><br/>dates, memory, checks<br/>(plain code, no model)"]
+    logic["<b>time.ts · recall.ts · guards.ts</b><br/>date math, memory, checks<br/>(plain code)"]
     models["<b>models.ts</b><br/>Anthropic adapter<br/>effort per tier · refusal fallback"]
     search["<b>search.ts</b><br/>Tavily (Brave optional)<br/>10-min cache, retries"]
     store["<b>store.ts</b><br/>PgStore"]
@@ -75,7 +75,7 @@ flowchart LR
 | Chat page | `public/index.html` | Sends each message with a turn ID, a per-browser **user ID**, the time zone and the locale. Streams the reply and shows live search status, sources with page dates, and citation links. A link to a turn in another chat opens that chat at that turn. |
 | HTTP server | `src/server.ts` | `POST /api/chat` answers over Server-Sent Events, and `GET /api/history` returns past turns. It also keeps one active run per conversation: a retried turn ID gets the stored answer, and a new message cancels the old run. Messages are limited to 4,000 characters. |
 | Turn graph | `src/graph.ts` | The LangGraph state graph that every message runs through (diagram below). |
-| Time | `src/time.ts` | Turns date phrases into a date window and an ordered list of candidate days, always in the user's own time zone. |
+| Time | `src/time.ts` | Turns a date phrase into a date window and an ordered list of candidate days, always in the user's own time zone. The date math is plain rules; a fast model only picks out which words in the message name the time (see `resolve_dates` below). |
 | Recall | `src/recall.ts` | Finds earlier turns **across all of this user's chats**: exact lookup by day, or keyword (TF-IDF) ranking within a date window. Tries every candidate day first ("last Tuesday" → two Tuesdays), then widens the window up to three times when the match is weak. |
 | Guards | `src/guards.ts` | The "no record" reply, citation links, the number check, the date-window filter, and verdict checks with the table and bottom line. |
 | Models | `src/models.ts` | The Anthropic adapter: `claude-opus-5-5`, effort low / medium / high per tier, structured outputs, a streamed tool loop, and server-side refusal fallback. |
@@ -91,10 +91,45 @@ Colours in both diagrams: **grey** is plain code, **blue** is a model call, **or
 
 This is the graph implemented in `src/graph.ts`.
 
-![Turn workflow](docs/workflow.png)
+```mermaid
+flowchart TD
+  msg(["User message<br/>+ turn ID · time zone · locale"]) --> ingest
+
+  ingest["<b>ingest</b> · code<br/>server timestamp + sequence<br/>user's local calendar day"] --> resolve
+  resolve["<b>resolve_dates</b><br/>fast model copies the time words,<br/>rules turn them into a date window<br/>(rules alone if the model fails)"] --> recall
+  recall["<b>recall</b> · code<br/>reads this user's earlier chats (Postgres)<br/>exact day lookup or topic ranking<br/>widens the window up to 3×"] --> router
+
+  router{"<b>router</b><br/>regex pre-checks,<br/>else fast model"}
+  router -- "smalltalk · clarify · search" --> synth
+  router -- "memory_only" --> when{"date<br/>given?"}
+  when -- "no, several days" --> whichday["<b>which day?</b> · code<br/>lists days + chats we have;<br/>the reply's date is applied<br/>to the original question"]
+  when -- "yes / one day / topic" --> gate{"anything<br/>recalled?"}
+  gate -- "yes" --> synth
+  gate -- "no" --> norecord["<b>abstention gate</b> · code<br/>fixed 'no record' reply<br/>lists the days we have"]
+  router -- "recheck" --> fan{"how many<br/>entities?"}
+  fan -- "≤ 3" --> one["<b>searcher</b> ×1<br/>one call covers all entities<br/>calls web_search (Tavily)"]
+  fan -- "> 3" --> many["<b>searcher</b> ×N<br/>LangGraph Send fan-out<br/>calls web_search (Tavily)"]
+  one --> verdicts
+  many --> verdicts
+  verdicts["<b>verdicts</b><br/>model proposes held / changed /<br/>corrected / could-not-verify,<br/>code checks every one"] --> synth
+
+  synth["<b>synthesize</b><br/>one writer call, streamed to the browser<br/>search route calls web_search itself"] --> guards
+  norecord --> guards
+  whichday --> guards
+  guards["<b>guards</b> · code<br/>citations → links · number check<br/>budget and downgrade notes"] --> store
+  store["<b>store</b> · code<br/>writes the finished turn to Postgres"] --> done(["SSE 'done'<br/>reply complete"])
+  store --> extract["<b>extract_claims</b><br/>facts for future rechecks → Postgres<br/>(after the reply is shown)"]
+
+  classDef code fill:#f4f4f5,stroke:#71717a,color:#18181b
+  classDef model fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+  classDef edge fill:#ecfdf5,stroke:#059669,color:#064e3b
+  class ingest,recall,guards,store,gate,fan,norecord,when,whichday code
+  class resolve,router,one,many,verdicts,synth,extract model
+  class msg,done edge
+```
 
 1. **ingest** — The server stamps the turn with its own time and a sequence number, and works out the user's local calendar day from the browser's IANA time zone. At 00:20 in Kolkata, "today" is already the new day.
-2. **resolve_dates** — Turns phrases like "since Monday", "last Tuesday", "3/11", "in August" or "a while ago" into a date window plus candidate days, using fixed rules (see DESIGN.md).
+2. **resolve_dates** — Turns phrases like "since Monday", "last Tuesday", "3/11", "in August" or "a month ago" into a date window plus candidate days. A fast model first **copies out the words that name the time** (it never produces a date) and says whether they are about our conversation or about the world; fixed rules then calculate the window from those words. This keeps "monday.com", "after 3.11" or "the 3 November launch" from being read as dates. If the model fails, or returns words the rules cannot resolve, the rules run on the whole message. Greetings, obvious memory questions and messages with no time words skip the model (see DESIGN.md).
 3. **recall** — Looks up earlier turns in Postgres, across **every chat this user has had**, not just the open one. A pure date question ("what did I ask on 3 November?") is an exact day lookup. A topic question ranks turns inside the window, and widens the window if the best match is weak or too close to call.
 4. **router** — Picks one of five routes. Obvious cases (greetings, "what did I ask…") are caught by regex, with no model call. Everything else goes to a fast model that returns structured JSON.
    - `smalltalk`, `clarify` and `search` go straight to the writer.
@@ -107,7 +142,7 @@ This is the graph implemented in `src/graph.ts`.
 8. **store** — The finished turn is written to Postgres, and the browser gets `done`.
 9. **extract_claims** — After the reply is shown, the facts it cited are saved for future rechecks. On a recheck, new claims come only from verdicts that code has checked.
 
-Diagram sources are `docs/workflow.mmd` and `docs/architecture.mmd` (Mermaid).
+Both diagrams are Mermaid, so GitHub renders them. The sources are `docs/workflow.mmd` and `docs/architecture.mmd`.
 
 ---
 
@@ -131,9 +166,9 @@ Diagram sources are `docs/workflow.mmd` and `docs/architecture.mmd` (Mermaid).
 |---|---|
 | `npm run dev` | Start the server and chat page |
 | `npm run db:up` / `npm run db:down` | Start or stop the Postgres container (data stays in the `mimo-pg` volume) |
-| `npm test` | 94 tests: date rules, recall, guards, graph routes, server reliability, store contract. Uses a fake model and fake search, so no keys are needed. The store contract also runs against Postgres when `MIMO_DATABASE_URL` is set (it is read from `.env`), so run `npm run db:up` first; with no `MIMO_DATABASE_URL` those 5 tests are skipped. |
+| `npm test` | 109 tests: date rules, recall, guards, graph routes, server reliability, store contract. Uses a fake model and fake search, so no keys are needed. The store contract also runs against Postgres when `MIMO_DATABASE_URL` is set (it is read from `.env`), so run `npm run db:up` first; with no `MIMO_DATABASE_URL` those 5 tests are skipped. |
 | `npm run typecheck` | `tsc --noEmit` |
-| `npm run eval` | Scenario suites against the real model and search, 3 repeats each. Reports pass rate and median / p90 turn time. |
+| `npm run eval` | Scenario suites (core, time, red-team) against the real model and search, 3 repeats each. Reports pass rate and median / p90 turn time. |
 | `npm run brief` | Seed three earlier chats for user `brief` in Postgres, then ask the three sample questions from new chats against the real model and search, printing each answer (needs keys) |
 
 Inspect the data directly with `docker exec -it mimo-postgres psql -U mimo -d mimo`.
