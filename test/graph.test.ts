@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { runTurn } from '../src/graph.js';
-import { SEARCHER_SYSTEM } from '../src/prompts.js';
+import { LIMITS, runTurn } from '../src/graph.js';
+import { SEARCHER_SYSTEM, TimeSchema } from '../src/prompts.js';
 import { MemoryStore, claimId } from '../src/store.js';
 import type { AgentEvent, Turn } from '../src/types.js';
 import { FakeModel, FakeSearch, turn } from './helpers.js';
@@ -125,6 +125,7 @@ describe('recheck', () => {
       'What did I ask you on 3 November? Is your answer still correct today?',
       'On 3 November I asked about HubSpot. Has any of them changed pricing or shipped something big since?',
       'I asked you about HubSpot pricing on 3 November. Has any pricing changed since then?',
+      'On 3 November you told me about HubSpot pricing. Have any of the prices changed?',
     ]) {
       const model = recheckModel('changed');
       model.script.router = { route: 'memory_only', entities: ['HubSpot'], queries: [], domains: [], reason: '' };
@@ -362,12 +363,71 @@ describe('memory across conversations (same user)', () => {
   });
 });
 
-describe('time: the model reads the phrase, the rules calculate it', () => {
+describe('time: the model works out the dates, code checks them, the rules are the fallback', () => {
   const noRoute = { route: 'search' as const, entities: [], queries: [], domains: [], reason: '' };
   const window = (r: { state: { resolved: { window: { start: string; end: string } | null } } }) => (r.state.resolved.window ? `${r.state.resolved.window.start}..${r.state.resolved.window.end}` : null);
+  const none = { about: 'none' as const, phrase: null, start: null, end: null, candidates: [], vague: false, eventAnchored: false, assumption: null };
+  const dates = (about: 'conversation' | 'world', phrase: string, start: string, end: string, candidates: string[] = [], extra: Partial<typeof none> = {}) =>
+    ({ ...none, about, phrase, start, end, candidates, ...extra });
+  const timeCall = (m: FakeModel) => m.calls.find((c) => c.system.startsWith('You read one chat message'));
+
+  it('uses the exact dates the model works out, in the same shape the rules produce', async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: dates('conversation', 'Last Monday', '2026-11-09', '2026-11-09', ['2026-11-09', '2026-11-02']) });
+    const { ask } = setup(model);
+    const r = await ask('Last Monday you shortlisted CRM tools for us. Have any of their prices changed?');
+    expect(r.state.timeFrom).toBe('model');
+    expect(r.state.resolved).toMatchObject({ window: { start: '2026-11-09', end: '2026-11-09', label: 'Monday, 9 November 2026' }, candidates: ['2026-11-09', '2026-11-02'] });
+  });
+
+  it("gives the model today's date, the user's time zone and date order, and the previous exchange", async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: dates('conversation', '3 November', '2026-11-03', '2026-11-03') });
+    const { ask, store } = setup(model);
+    await store.putTurn(turn({ id: 'w', seq: 1, localDay: '2026-11-10', user: 'when did we talk about CRM?', assistant: 'Which day do you mean?', route: 'clarify' }));
+    const r = await ask('3 November');
+    expect(window(r)).toBe('2026-11-03..2026-11-03');
+    const prompt = timeCall(model)!.prompt!;
+    expect(prompt).toContain('Today: Wednesday, 11 November 2026 (2026-11-11), time zone UTC.');
+    expect(prompt).toContain('day-first (3/11 = 3 November)');
+    expect(prompt).toContain('Which day do you mean?');
+  });
+
+  it("uses the model's dates where the rules cannot read the words (\"two Mondays ago\", \"in 2025\")", async () => {
+    for (const [q, phrase, start, end] of [
+      ['Has the Pipedrive price changed since we discussed it two Mondays ago?', 'two Mondays ago', '2026-11-02', '2026-11-02'],
+      ['Did any of the CRM tools we looked at in 2025 raise prices?', 'in 2025', '2025-01-01', '2025-12-31'],
+    ]) {
+      const model = new FakeModel({ router: noRoute, answer: 'ok', time: dates('conversation', phrase, start, end) });
+      const { ask } = setup(model);
+      const r = await ask(q);
+      expect(r.state.timeFrom, q).toBe('model');
+      expect(window(r), q).toBe(`${start}..${end}`);
+    }
+  });
+
+  it("keeps the rules' dates when the model's arithmetic disagrees with them on the same words", async () => {
+    // "Last Monday" asked on Wed 11 Nov is 9 Nov; the model says 2 Nov.
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: dates('conversation', 'Last Monday', '2026-11-02', '2026-11-02', ['2026-11-02']) });
+    const { ask } = setup(model);
+    const r = await ask('Last Monday you shortlisted CRM tools for us. Have any of their prices changed?');
+    expect(r.state.timeFrom).toBe('rules');
+    expect(r.state.resolved.candidates).toEqual(['2026-11-09', '2026-11-02']);
+  });
+
+  it('rejects dates that are not real or that put a past conversation in the future, and falls back to the rules', async () => {
+    for (const bad of [
+      dates('conversation', 'since 3 November', '2026-13-40', '2026-11-11'),
+      dates('conversation', 'since 3 November', '2026-11-03', '2026-12-25'),
+    ]) {
+      const model = new FakeModel({ router: noRoute, answer: 'ok', time: bad });
+      const { ask } = setup(model);
+      const r = await ask('Has HubSpot pricing changed since 3 November?');
+      expect(r.state.timeFrom).toBe('rules');
+      expect(window(r)).toBe('2026-11-03..2026-11-11');
+    }
+  });
 
   it('a product name is not a date: "monday.com" gets no window and the search is not date-limited', async () => {
-    const model = new FakeModel({ router: noRoute, searches: ['monday.com pricing'], answer: 'ok', time: { phrase: null, about: 'none' } });
+    const model = new FakeModel({ router: noRoute, searches: ['monday.com pricing'], answer: 'ok', time: none });
     const { ask, search } = setup(model);
     const r = await ask('what does monday.com cost per seat?');
     expect(window(r)).toBeNull();
@@ -383,8 +443,8 @@ describe('time: the model reads the phrase, the rules calculate it', () => {
     expect(window(r)).toBe('2026-11-09..2026-11-09');
   });
 
-  it('a date inside the topic does not hijack the question: only the conversation time is used', async () => {
-    const model = new FakeModel({ router: noRoute, answer: 'ok', time: { phrase: 'on 3 November', about: 'conversation' } });
+  it('a date inside the topic does not hijack the question: only the conversation date is used', async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: dates('conversation', 'on 3 November', '2026-11-03', '2026-11-03') });
     const { ask } = setup(model);
     const r = await ask('Has HubSpot pricing changed since the 9 November launch that I asked about on 3 November?');
     expect(window(r)).toBe('2026-11-03..2026-11-03');
@@ -392,7 +452,7 @@ describe('time: the model reads the phrase, the rules calculate it', () => {
   });
 
   it('time about the world bounds the search but does not turn the message into a memory lookup', async () => {
-    const model = new FakeModel({ router: noRoute, searches: ['AI news'], answer: 'ok', time: { phrase: 'last week', about: 'world' } });
+    const model = new FakeModel({ router: noRoute, searches: ['AI news'], answer: 'ok', time: dates('world', 'last week', '2026-10-29', '2026-11-04') });
     const { ask, search, store } = setup(model);
     await store.putTurn(crmTurn());
     const r = await ask('what happened in AI news last week?');
@@ -402,19 +462,11 @@ describe('time: the model reads the phrase, the rules calculate it', () => {
   });
 
   it('a phrase that is not in the message is ignored: the rules read the whole message', async () => {
-    const model = new FakeModel({ router: noRoute, answer: 'ok', time: { phrase: 'on 1 January', about: 'conversation' } });
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: dates('conversation', 'on 1 January', '2026-01-01', '2026-01-01') });
     const { ask } = setup(model);
     const r = await ask('Has HubSpot pricing changed since 3 November?');
     expect(r.state.timeFrom).toBe('rules');
     expect(window(r)).toBe('2026-11-03..2026-11-11');
-  });
-
-  it('a phrase the rules cannot resolve falls back to the rules on the whole message', async () => {
-    const model = new FakeModel({ router: noRoute, answer: 'ok', time: { phrase: 'ages back', about: 'conversation' } });
-    const { ask } = setup(model);
-    const r = await ask('Has anything changed since ages back, or since 3 November?');
-    expect(r.state.timeFrom).toBe('rules');
-    expect(r.state.resolved.window).not.toBeNull();
   });
 
   it('a failing time model never breaks a recheck: the rules supply the baseline', async () => {
@@ -432,22 +484,53 @@ describe('time: the model reads the phrase, the rules calculate it', () => {
     expect(r.state.baselineDay).toBe('2026-11-03');
   });
 
-  it('greetings, obvious memory questions and messages with no time words never call the time model', async () => {
-    const model = new FakeModel({ router: noRoute, answer: 'ok', time: { phrase: null, about: 'none' } });
-    const { ask, store } = setup(model);
-    await store.putTurn(crmTurn());
-    for (const q of ['hello!', 'what did I ask on 3 November?', 'whats tavily']) {
-      await ask(q);
-      expect(model.calls.some((c) => c.system.startsWith('You read one chat message')), q).toBe(false);
+  it('reads time on the "time" tier (Claude Haiku 5.5 by default)', async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: none });
+    const { ask } = setup(model);
+    await ask('what does monday.com cost per seat?');
+    expect(timeCall(model)?.tier).toBe('time');
+  });
+
+  it('a time model that hangs falls back to the rules at its deadline instead of holding up the turn', async () => {
+    class Hanging extends FakeModel {
+      async structured<T>(o: Parameters<FakeModel['structured']>[0] & { signal?: AbortSignal }) {
+        if (o.schema === TimeSchema) {
+          await new Promise((_, reject) => o.signal?.addEventListener('abort', () => reject(new Error('aborted by deadline'))));
+        }
+        return super.structured<T>(o);
+      }
+    }
+    const saved = LIMITS.timeReadMs;
+    LIMITS.timeReadMs = 50;
+    try {
+      const model = new Hanging({ router: noRoute, answer: 'ok', time: none });
+      const { ask } = setup(model);
+      const t0 = Date.now();
+      const r = await ask('Has HubSpot pricing changed since 3 November?');
+      expect(r.state.timeFrom).toBe('rules');
+      expect(window(r)).toBe('2026-11-03..2026-11-11');
+      expect(Date.now() - t0).toBeLessThan(2000);
+    } finally {
+      LIMITS.timeReadMs = saved;
     }
   });
 
-  it('the previous exchange is shown to the time model, so a short reply like "3 November" is understood', async () => {
-    const model = new FakeModel({ router: noRoute, answer: 'ok', time: { phrase: '3 November', about: 'conversation' } });
+  it('greetings, messages with no time words and memory questions the rules can read never call the time model', async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'ok', time: none });
     const { ask, store } = setup(model);
-    await store.putTurn(turn({ id: 'w', seq: 1, localDay: '2026-11-10', user: 'when did we talk about CRM?', assistant: 'Which day do you mean?', route: 'clarify' }));
-    const r = await ask('3 November');
-    expect(window(r)).toBe('2026-11-03..2026-11-03');
-    expect(model.calls.find((c) => c.system.startsWith('You read one chat message'))?.prompt).toContain('Which day do you mean?');
+    await store.putTurn(crmTurn());
+    for (const q of ['hello!', 'what did I ask on 3 November?', 'what did I ask last Monday?', 'whats tavily']) {
+      await ask(q);
+      expect(timeCall(model), q).toBeUndefined();
+    }
+  });
+
+  it('a memory question whose date the rules cannot read goes to the time model', async () => {
+    const model = new FakeModel({ router: noRoute, answer: 'On Tuesday 3 November you asked what HubSpot Starter costs [T1].', time: dates('conversation', 'two Tuesdays ago', '2026-11-03', '2026-11-03') });
+    const { ask, store } = setup(model);
+    await store.putTurn(crmTurn());
+    const r = await ask('what did I ask two Tuesdays ago?');
+    expect(r.state.timeFrom).toBe('model');
+    expect(r.state.recalled.matchedDay).toBe('2026-11-03');
   });
 });

@@ -2,7 +2,7 @@ flowchart TD
   msg(["User message<br/>+ turn ID · time zone · locale"]) --> ingest
 
   ingest["<b>ingest</b> · code<br/>server timestamp + sequence<br/>user's local calendar day"] --> resolve
-  resolve["<b>resolve_dates</b><br/>fast model copies the time words,<br/>rules turn them into a date window<br/>(rules alone if the model fails)"] --> recall
+  resolve["<b>resolve_dates</b><br/>Claude Haiku works out the exact dates from today (4 s limit),<br/>code checks them against time.ts rules<br/>(rules alone if the model fails, is slow or is wrong)"] --> recall
   recall["<b>recall</b> · code<br/>reads this user's earlier chats (Postgres)<br/>exact day lookup or topic ranking<br/>widens the window up to 3×"] --> router
 
   router{"<b>router</b><br/>regex pre-checks,<br/>else fast model"}

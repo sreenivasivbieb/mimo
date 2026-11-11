@@ -6,7 +6,7 @@ A chat agent with exactly one tool, **web search**, that answers questions about
 - *"What did we talk about last Tuesday?"*
 - *"Has anything changed with those prices since Monday?"*
 
-The model writes the answers. **Code** works out what "Monday" means in your time zone, finds the earlier messages, checks citations and numbers, and decides whether something really changed. Why it is built this way, and what we ran into along the way, is in **[DESIGN.md](DESIGN.md)**.
+The model writes the answers. **Code** decides everything that must be right: a fast model works out what "Monday" means from today's date in your time zone and code checks those dates (with fixed rules as the fallback); code finds the earlier messages, checks citations and numbers, and decides whether something really changed. How each part is designed, and why, is in **[DESIGN.md](DESIGN.md)**.
 
 ---
 
@@ -50,7 +50,7 @@ flowchart LR
     store["<b>store.ts</b><br/>PgStore"]
   end
 
-  claude[("Anthropic API<br/>claude-opus-5-5")]
+  claude[("Anthropic API<br/>claude-opus-5-5 · claude-haiku-5-5")]
   tavily[("Tavily API")]
   pg[("Postgres · Docker<br/>turns · claims")]
 
@@ -75,10 +75,10 @@ flowchart LR
 | Chat page | `public/index.html` | Sends each message with a turn ID, a per-browser **user ID**, the time zone and the locale. Streams the reply and shows live search status, sources with page dates, and citation links. A link to a turn in another chat opens that chat at that turn. |
 | HTTP server | `src/server.ts` | `POST /api/chat` answers over Server-Sent Events, and `GET /api/history` returns past turns. It also keeps one active run per conversation: a retried turn ID gets the stored answer, and a new message cancels the old run. Messages are limited to 4,000 characters. |
 | Turn graph | `src/graph.ts` | The LangGraph state graph that every message runs through (diagram below). |
-| Time | `src/time.ts` | Turns a date phrase into a date window and an ordered list of candidate days, always in the user's own time zone. The date math is plain rules; a fast model only picks out which words in the message name the time (see `resolve_dates` below). |
+| Time | `src/time.ts` | Turns a date phrase into a date window and an ordered list of candidate days, always in the user's own time zone. Claude Haiku works out the exact dates first; these rules check its arithmetic and are the fallback (see `resolve_dates` below). |
 | Recall | `src/recall.ts` | Finds earlier turns **across all of this user's chats**: exact lookup by day, or keyword (TF-IDF) ranking within a date window. Tries every candidate day first ("last Tuesday" → two Tuesdays), then widens the window up to three times when the match is weak. |
 | Guards | `src/guards.ts` | The "no record" reply, citation links, the number check, the date-window filter, and verdict checks with the table and bottom line. |
-| Models | `src/models.ts` | The Anthropic adapter: `claude-opus-5-5`, effort low / medium / high per tier, structured outputs, a streamed tool loop, and server-side refusal fallback. |
+| Models | `src/models.ts` | The Anthropic adapter: `claude-haiku-5-5` for reading date phrases, `claude-opus-5-5` (effort low / medium / high) for everything else; structured outputs, a streamed tool loop, and server-side refusal fallback (not on Haiku, which has none). |
 | Search | `src/search.ts` | The single `web_search` tool, backed by Tavily (Brave optional), with a 10-minute cache, timeouts and retries. |
 | Prompts | `src/prompts.ts` | The router, writer, verdict and extraction prompts, and the context blocks that code builds for each turn. |
 | Store | `src/store.ts` | Postgres (`turns`, `claims`) behind a `Store` interface. An in-memory version with the same contract is used for tests. |
@@ -96,7 +96,7 @@ flowchart TD
   msg(["User message<br/>+ turn ID · time zone · locale"]) --> ingest
 
   ingest["<b>ingest</b> · code<br/>server timestamp + sequence<br/>user's local calendar day"] --> resolve
-  resolve["<b>resolve_dates</b><br/>fast model copies the time words,<br/>rules turn them into a date window<br/>(rules alone if the model fails)"] --> recall
+  resolve["<b>resolve_dates</b><br/>Claude Haiku works out the exact dates from today (4 s limit),<br/>code checks them against time.ts rules<br/>(rules alone if the model fails, is slow or is wrong)"] --> recall
   recall["<b>recall</b> · code<br/>reads this user's earlier chats (Postgres)<br/>exact day lookup or topic ranking<br/>widens the window up to 3×"] --> router
 
   router{"<b>router</b><br/>regex pre-checks,<br/>else fast model"}
@@ -129,7 +129,7 @@ flowchart TD
 ```
 
 1. **ingest** — The server stamps the turn with its own time and a sequence number, and works out the user's local calendar day from the browser's IANA time zone. At 00:20 in Kolkata, "today" is already the new day.
-2. **resolve_dates** — Turns phrases like "since Monday", "last Tuesday", "3/11", "in August" or "a month ago" into a date window plus candidate days. A fast model first **copies out the words that name the time** (it never produces a date) and says whether they are about our conversation or about the world; fixed rules then calculate the window from those words. This keeps "monday.com", "after 3.11" or "the 3 November launch" from being read as dates. If the model fails, or returns words the rules cannot resolve, the rules run on the whole message. Greetings, obvious memory questions and messages with no time words skip the model (see DESIGN.md).
+2. **resolve_dates** — Turns phrases like "since Monday", "last Tuesday", "3/11", "in August" or "a month ago" into a date window plus candidate days. **Claude Haiku 5.5**, the fastest model, is given **today's date** (in the user's time zone) and their date order, and returns the **exact dates** the message refers to ("last Monday" → `2026-11-09`, with `2026-11-02` as the backup candidate), in the same form the `time.ts` rules produce, so every later step uses them unchanged. It also says whether the time is about our conversation or about the world. Code then checks the dates: they must be real, a past conversation can't be in the future, and wherever `time.ts` understands the same words it recomputes them, and its dates win on a disagreement. Phrases the rules can't read ("two Mondays ago", "in 2025", "since the 1st") use the model's dates. This also keeps "monday.com", "after 3.11" or "before a job interview" from being read as dates. If the model fails, takes longer than 4 seconds, or returns dates that fail the checks, the rules run on the whole message. Greetings, messages with no time words, and memory questions whose date the rules already read skip the model (see DESIGN.md).
 3. **recall** — Looks up earlier turns in Postgres, across **every chat this user has had**, not just the open one. A pure date question ("what did I ask on 3 November?") is an exact day lookup. A topic question ranks turns inside the window, and widens the window if the best match is weak or too close to call.
 4. **router** — Picks one of five routes. Obvious cases (greetings, "what did I ask…") are caught by regex, with no model call. Everything else goes to a fast model that returns structured JSON.
    - `smalltalk`, `clarify` and `search` go straight to the writer.
@@ -152,7 +152,8 @@ Both diagrams are Mermaid, so GitHub renders them. The sources are `docs/workflo
 |---|---|
 | `MIMO_DATABASE_URL` | Postgres for history. The default points at the Docker container (`postgres://mimo:mimo@localhost:5433/mimo`). It is deliberately not `DATABASE_URL`, so a value exported for another project is never used. |
 | `ANTHROPIC_API_KEY` | Claude API key (an `ant auth login` profile also works) |
-| `MODEL_FAST` / `MODEL_MAIN` / `MODEL_DEEP` | Optional model per tier. Default `claude-opus-5-5` for all three. |
+| `MODEL_TIME` | Optional model for reading date phrases. Default `claude-haiku-5-5`. |
+| `MODEL_FAST` / `MODEL_MAIN` / `MODEL_DEEP` | Optional model per tier (router and extraction / writer / recheck). Default `claude-opus-5-5` for all three. |
 | `TAVILY_API_KEY` (or `BRAVE_API_KEY`) | Web search |
 | `AGENT_TZ` | Fallback time zone if the browser sends none |
 | `PORT` | HTTP port, default 3000 |
@@ -166,7 +167,7 @@ Both diagrams are Mermaid, so GitHub renders them. The sources are `docs/workflo
 |---|---|
 | `npm run dev` | Start the server and chat page |
 | `npm run db:up` / `npm run db:down` | Start or stop the Postgres container (data stays in the `mimo-pg` volume) |
-| `npm test` | 109 tests: date rules, recall, guards, graph routes, server reliability, store contract. Uses a fake model and fake search, so no keys are needed. The store contract also runs against Postgres when `MIMO_DATABASE_URL` is set (it is read from `.env`), so run `npm run db:up` first; with no `MIMO_DATABASE_URL` those 5 tests are skipped. |
+| `npm test` | 121 tests: date rules and the checks on model dates, time reading and its fallbacks, recall, guards, graph routes, server reliability, store contract. Uses a fake model and fake search, so no keys are needed. The store contract also runs against Postgres when `MIMO_DATABASE_URL` is set (it is read from `.env`), so run `npm run db:up` first; with no `MIMO_DATABASE_URL` those 5 tests are skipped. |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run eval` | Scenario suites (core, time, red-team) against the real model and search, 3 repeats each. Reports pass rate and median / p90 turn time. |
 | `npm run brief` | Seed three earlier chats for user `brief` in Postgres, then ask the three sample questions from new chats against the real model and search, printing each answer (needs keys) |

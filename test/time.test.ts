@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { localDay, mayMentionTime, relativeAge, resolveDates } from '../src/time.js';
+import { localDay, mayMentionTime, relativeAge, resolveDates, resolvedFromModel, type ModelTime } from '../src/time.js';
 
 const WED = '2026-11-11'; // a Wednesday
 
@@ -90,5 +90,38 @@ describe('mayMentionTime (the gate before the time model)', () => {
   it('lets time-like messages through and skips plain ones', () => {
     for (const q of ['what did I ask on Monday?', 'since 3/11', 'in August', '3rd of May', 'a month ago', 'last time', 'any news before the launch', 'what about 2026-11-03']) expect(mayMentionTime(q), q).toBe(true);
     for (const q of ['whats tavily', 'price of iphone 15', 'who won ipl 2025', 'hello']) expect(mayMentionTime(q), q).toBe(false);
+    expect(mayMentionTime('what did we look at in 2025?')).toBe(true);
+    expect(mayMentionTime('what did I ask two Tuesdays ago?', true)).toBe(true);
+    // "strong" ignores words that usually point at the conversation, not a date
+    expect(mayMentionTime('what did we discuss in our previous conversation?', true)).toBe(false);
+    expect(mayMentionTime('what did we discuss in our previous conversation?')).toBe(true);
+  });
+});
+
+describe('resolvedFromModel (checks dates a model worked out)', () => {
+  const m = (start: string | null, end: string | null, extra: Partial<ModelTime> = {}): ModelTime =>
+    ({ about: 'conversation', phrase: 'x', start, end, candidates: [], vague: false, eventAnchored: false, assumption: null, ...extra });
+  it('accepts real past dates and returns the same shape as the rules', () => {
+    expect(resolvedFromModel(m('2026-11-09', '2026-11-09', { candidates: ['2026-11-09', '2026-11-02'] }), WED)).toEqual({
+      resolved: { window: { start: '2026-11-09', end: '2026-11-09', label: 'Monday, 9 November 2026' }, candidates: ['2026-11-09', '2026-11-02'], vague: false, eventAnchored: false },
+    });
+    // a single day with no candidates gets that day as its candidate, like the rules
+    expect(resolvedFromModel(m('2026-11-03', '2026-11-03'), WED)).toMatchObject({ resolved: { candidates: ['2026-11-03'] } });
+    expect(resolvedFromModel(m('2026-11-03', '2026-11-03', { assumption: 'I read 3/11 as 3 November (day-first).' }), WED)).toMatchObject({ resolved: { assumption: 'I read 3/11 as 3 November (day-first).' } });
+  });
+  it('rejects what cannot be right', () => {
+    for (const [why, x] of [
+      ['not a date', m('2026-02-30', '2026-02-30')],
+      ['missing', m(null, null)],
+      ['start after end', m('2026-11-09', '2026-11-03')],
+      ['past conversation in the future', m('2026-11-12', '2026-11-12')],
+      ['too far back', m('2020-01-01', '2020-01-02')],
+      ['window over a year', m('2025-01-01', '2026-11-01')],
+      ['candidate far from the window', m('2026-11-09', '2026-11-09', { candidates: ['2026-06-01'] })],
+    ] as const) expect('problem' in resolvedFromModel(x, WED), why).toBe(true);
+  });
+  it('allows a world window to reach into the future (an upcoming release), but not a conversation', () => {
+    expect('resolved' in resolvedFromModel(m('2026-11-20', '2026-11-20', { about: 'world' }), WED)).toBe(true);
+    expect('problem' in resolvedFromModel(m('2026-11-20', '2026-11-20'), WED)).toBe(true);
   });
 });

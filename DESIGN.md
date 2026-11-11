@@ -6,7 +6,7 @@ A chat agent with one tool, **web search**, built to answer questions about time
 
 **The model writes; code decides.** Dates, memory lookups, citations, numbers and change verdicts are computed by plain code. The model receives the results as text and writes the answer around them.
 
-The one place a model sits in front of the code is reading *which words name a time*. It never produces a date; code always does the calculation, and if the model fails, plain rules take over.
+The one place a model sits in front of the code is reading time: a fast model works out the exact dates a message refers to, and code checks them against the plain date rules, which also take over if the model fails.
 
 ## Turn flow
 
@@ -22,7 +22,7 @@ synthesize → guards → store (reply done) → extract_claims
 
 | Component | File | Role |
 |---|---|---|
-| Time | `src/time.ts` | Date phrase → date window + candidate days, in the user's time zone (rules) |
+| Time | `src/time.ts` | Date rules (phrase → window + candidate days, in the user's time zone) and the checks on the time model's dates |
 | Recall | `src/recall.ts` | Finds earlier turns across all of a user's chats |
 | Turn graph | `src/graph.ts` | Router, searchers, verdicts, writer, claim extraction |
 | Guards | `src/guards.ts` | No-record reply, citations, number check, verdict checks |
@@ -35,17 +35,37 @@ synthesize → guards → store (reply done) → extract_claims
 
 ## Key points
 
-### Time
-- **A model reads, rules calculate.** A fast model copies the exact words that name the time ("on Monday", "since Monday", "a month ago") and says whether they are about the *conversation* or the *world*. `resolveDates` turns only those words into a window.
-  - It stops non-dates being read as dates: `monday.com`, `after 3.11`, "before a job interview", "the 3 November launch", "march" the verb.
-  - A date inside the topic no longer hijacks the question; a short reply like "3 November" is read with the previous exchange.
-  - "World" time (news from last week) bounds the search but does not trigger a memory lookup.
-- **Fallback to rules.** On a model error, words that are not in the message, or words the rules cannot resolve, the same rules run on the whole message, as before the model was added.
-- **No model call** for greetings, obvious memory questions (regex), or messages with no time words.
+### Time (`resolve_dates` in `src/graph.ts`, rules in `src/time.ts`)
+
+**How the dates are worked out**
+1. **A fast model works out the exact dates.** Claude Haiku 5.5 (effort `low`) gets today's date and weekday in the user's time zone, how the user writes numeric dates (3/11), the previous exchange, and the message.
+2. **It answers in the same shape the rules produce**, so recall, the router, the recheck baseline and the writer use it unchanged:
+
+   | Message (asked Wed 11 Nov) | Model's answer |
+   |---|---|
+   | "Last Monday you shortlisted CRM tools…" | `about: conversation`, words "Last Monday", window 9 Nov, candidates 9 Nov → 2 Nov |
+   | "what does monday.com cost?" | `about: none`, no window |
+   | "AI news from last week" | `about: world`, window 29 Oct – 4 Nov |
+
+3. **Code checks the dates** (`resolvedFromModel`): they must be real, a past conversation can't be in the future, a window can't span over a year or start 3+ years back, and candidate days must be near the window. The words must appear in the message.
+4. **`time.ts` double-checks the arithmetic.** Where the rules understand the model's words, they recompute the dates, and **the rules' dates win on a disagreement**. In testing, a model put "last weekend" on a Thursday–Friday; the rules corrected it.
+5. **Fallback to rules.** On a model error or refusal, no answer within **4 seconds**, or an answer that fails the checks, the rules run on the whole message.
+
+**When the model is skipped:** greetings, messages with no time words, and memory questions whose date the rules already read ("what did I ask on 3 November?"). These stay fast and model-free.
+
+**What this gives over rules alone**
+- Phrases the rules can't read get exact dates: "two Mondays ago", "in 2025", "since the 1st".
+- Non-dates stay non-dates: `monday.com`, `after 3.11`, "before a job interview", "march" the verb.
+- **Conversation vs world time:** "news from last week" limits the web search but doesn't trigger a memory lookup.
+- A short reply like "3 November" is read in the context of the question it answers.
+- The time words are removed from the topic before recall, so "two Tuesdays ago" isn't searched for as a topic.
+
+**The date rules (`time.ts`)**, which the model's prompt follows and code checks against:
 - "Today" is the user's local day, from the browser's IANA time zone.
-- A bare weekday or date in the future means the past one. "Last Tuesday" keeps two candidates.
+- A bare weekday or date in the future means the past one. "Last Tuesday" keeps two candidates: the most recent, then the week before.
 - `3/11` follows the browser locale, states the assumption, and asks if both readings have messages.
-- "In August" = whole month; "this week" = last 7 days; "last weekend" = the last finished Saturday + Sunday; "a month ago" = about 30 days back, ±7, flagged vague; vague phrases get a wide window; "before the holidays" is never guessed.
+- "In August" = whole month; "this week" = last 7 days; "last week" = 13 to 7 days ago; "last weekend" = the last finished Saturday + Sunday; "a month ago" = about 30 days back, ±7, flagged vague.
+- Vague phrases get a wide window; "before the holidays" is never guessed.
 - `24/7` and "I sat down" are not dates. Relative ages ("8 days ago") are computed in code.
 
 ### Recall
@@ -80,9 +100,11 @@ synthesize → guards → store (reply done) → extract_claims
 - A memory question with nothing recalled gets a fixed "no record" reply; a reply that describes past chats without citing a recalled turn is replaced.
 
 ### Models
-- `claude-opus-5-5` for all tiers, with effort `low` (time reading, router, extraction), `medium` (writer), `high` (recheck).
-- Structured outputs for router, verdicts and extraction; a streamed tool loop for the writer and searchers.
-- Server-side refusal fallback; the system prompt is cached and per-turn context goes last.
+- `claude-haiku-5-5` (effort `low`) reads date phrases: a small extraction task where speed matters most. Override with `MODEL_TIME`.
+- `claude-opus-5-5` for everything else, with effort `low` (router, extraction), `medium` (writer), `high` (recheck).
+- Server-side refusal fallback on Opus; Haiku has none, so a declined time read just falls back to the rules.
+- Structured outputs for time reading, router, verdicts and extraction; a streamed tool loop for the writer and searchers.
+- The system prompt is cached and the per-turn context goes last.
 
 ### Search
 - Tavily with page text for vendor-domain queries; Brave as an option.
@@ -96,16 +118,7 @@ synthesize → guards → store (reply done) → extract_claims
 - Postgres with upserts and deterministic claim IDs; the server refuses to start without the database.
 - The app reads `MIMO_DATABASE_URL`, not `DATABASE_URL`, so another project's database is never used.
 
-## Known limits
-
-- **Identity is per browser.** Another browser or cleared storage starts a new memory.
-- **JavaScript-rendered pricing pages** often lack prices in search text, so many price rechecks end in `could-not-verify`.
-- **English only.** Memory, recheck and date patterns are English, and so are the time-reading prompt and rules.
-- **Obvious memory questions are read by rules alone** (no model, for speed), so "what did I ask yesterday about the 3 November launch?" still picks the explicit date.
-- **The time model adds one fast call** to messages that mention time (not to greetings or memory questions). If it is down, you get the rule behaviour, including its false positives.
-- **Recall thresholds** (0.12 / 0.04) are not tuned yet.
-
 ## Verification
 
-- `npm test`: 109 tests with a fake model and fake search — date rules, recall, guards, graph routes, time reading and its fallback, server reliability, store contract (also against Postgres).
+- `npm test`: 121 tests with a fake model and fake search — date rules, the checks on model dates, recall, guards, graph routes, time reading and every fallback path (error, timeout, bad or disagreeing dates), server reliability, store contract (also against Postgres).
 - `npm run eval` (core, time, red-team suites) and `npm run brief` run scenarios against the real model and search.

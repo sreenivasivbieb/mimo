@@ -1,11 +1,11 @@
 // Model calls behind a small interface so tests can swap in a fake.
-// Anthropic (Claude) only; tiers map to MODEL_FAST / MODEL_MAIN / MODEL_DEEP.
+// Anthropic (Claude) only; tiers map to MODEL_TIME / MODEL_FAST / MODEL_MAIN / MODEL_DEEP.
 import Anthropic from '@anthropic-ai/sdk';
 import { betaZodOutputFormat } from '@anthropic-ai/sdk/helpers/beta/zod';
 import { z } from 'zod';
 import { WEB_SEARCH_TOOL } from './search.js';
 
-export type Tier = 'fast' | 'main' | 'deep';
+export type Tier = 'time' | 'fast' | 'main' | 'deep';
 export type Msg = { role: 'user' | 'assistant'; content: string };
 export type ToolCall = { id: string; name: string; input: unknown };
 export type Usage = { input: number; output: number; cacheRead: number };
@@ -24,25 +24,33 @@ export interface Model {
   }): Promise<{ text: string; usage: Usage }>;
 }
 
-const tierModel = (env: NodeJS.ProcessEnv, tier: Tier, fallback: string) =>
-  env[{ fast: 'MODEL_FAST', main: 'MODEL_MAIN', deep: 'MODEL_DEEP' }[tier]] || fallback;
+const DEFAULT_MODEL = 'claude-opus-5-5';
+// Reading the time phrase is a small extraction task in front of every time-related message, so it
+// gets the fastest model: Claude Haiku 5.5. Everything else defaults to Claude Opus 5.5.
+const TIER_DEFAULT: Record<Tier, string> = { time: 'claude-haiku-5-5', fast: DEFAULT_MODEL, main: DEFAULT_MODEL, deep: DEFAULT_MODEL };
+const TIER_ENV: Record<Tier, string> = { time: 'MODEL_TIME', fast: 'MODEL_FAST', main: 'MODEL_MAIN', deep: 'MODEL_DEEP' };
+
+/** The model a tier uses: its MODEL_* variable, else the default above. */
+export const modelForTier = (tier: Tier, env: NodeJS.ProcessEnv = process.env) => env[TIER_ENV[tier]] || TIER_DEFAULT[tier];
 
 export function modelFromEnv(env = process.env): Model {
   return new AnthropicModel(env);
 }
 
-const DEFAULT_MODEL = 'claude-opus-5-5';
-// Opus 5.5 always thinks; effort is the only depth control (its default is medium).
-const EFFORT: Record<Tier, 'low' | 'medium' | 'high'> = { fast: 'low', main: 'medium', deep: 'high' };
+// Opus 5.5 and Haiku 5.5 always think; effort is the depth control (both default to medium, so set it).
+const EFFORT: Record<Tier, 'low' | 'medium' | 'high'> = { time: 'low', fast: 'low', main: 'medium', deep: 'high' };
 // On a safety decline, the API re-runs the request on a fallback model it picks by category.
+// Haiku has no server-side fallback (a fallback list is a 400), so its requests go without it;
+// a declined time read simply fails and the date rules take over.
 const FALLBACK = { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' as const };
+export const fallbackFor = (model: string) => (model.startsWith('claude-haiku') ? {} : FALLBACK);
 
 export class AnthropicModel implements Model {
   private client = new Anthropic({ maxRetries: 2 });
   constructor(private env = process.env) {}
 
   private model(tier: Tier) {
-    return tierModel(this.env, tier, DEFAULT_MODEL);
+    return modelForTier(tier, this.env);
   }
 
   // Stable system prompt first and cached; the volatile per-turn block goes last in the user message.
@@ -53,7 +61,7 @@ export class AnthropicModel implements Model {
   async structured<T>(o: { tier: Tier; system: string; prompt: string; schema: z.ZodType<T>; signal?: AbortSignal }) {
     const res = await this.client.beta.messages.parse(
       {
-        ...FALLBACK,
+        ...fallbackFor(this.model(o.tier)),
         model: this.model(o.tier),
         max_tokens: 16000,
         system: this.system(o.system),
@@ -78,7 +86,7 @@ export class AnthropicModel implements Model {
       const lastRound = round >= maxRounds;
       const stream = this.client.beta.messages.stream(
         {
-          ...FALLBACK,
+          ...fallbackFor(this.model(o.tier)),
           model: this.model(o.tier),
           max_tokens: 16000,
           system: this.system(o.system),

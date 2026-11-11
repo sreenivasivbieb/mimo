@@ -16,11 +16,14 @@ const WEEKDAY_RE = '(sunday|monday|tuesday|wednesday|thursday|friday|saturday)';
  * Cheap pre-check: could this message refer to a time at all? Used to skip the model that reads time
  * phrases when there is nothing to read ("whats tavily"). Deliberately generous; the model has the final say.
  */
-const TIME_CUE = new RegExp(
-  `\\b\\d{1,2}[/.]\\d{1,2}\\b|\\b\\d{4}-\\d{2}-\\d{2}\\b|\\b\\d{1,2}(?:st|nd|rd|th)\\b|\\b(?:${WEEKDAYS.join('|')}|yesterday|today|tonight|tomorrow|morning|afternoon|evening|night|ago|since|last|before|earlier|previous|previously|recent|recently|weeks?|weekends?|months?|years?|quarter)\\b|\\b${MONTH_RE}\\b`,
-  'i',
-);
-export const mayMentionTime = (text: string) => TIME_CUE.test(text);
+const STRONG_CUE = `\\b\\d{1,2}[/.]\\d{1,2}\\b|\\b\\d{4}-\\d{2}-\\d{2}\\b|\\b\\d{1,2}(?:st|nd|rd|th)\\b|\\b(?:in|during|since|from|of|before|after) (?:19|20)\\d{2}\\b|\\b(?:sun|mon|tues|wednes|thurs|fri|satur)days?\\b|\\b(?:yesterday|today|tonight|tomorrow|morning|afternoon|evening|night|ago|weeks?|weekends?|months?|years?|quarter)\\b|\\b${MONTH_RE}\\b`;
+const TIME_CUE = new RegExp(`${STRONG_CUE}|\\b(?:since|last|before|earlier|previous|previously|recent|recently)\\b`, 'i');
+const STRONG_TIME_CUE = new RegExp(STRONG_CUE, 'i');
+/**
+ * `strong` leaves out words that often refer to the conversation itself rather than a date
+ * ("our previous conversation", "last time"), for messages already known to be about our history.
+ */
+export const mayMentionTime = (text: string, strong = false) => (strong ? STRONG_TIME_CUE : TIME_CUE).test(text);
 
 /** Validate an IANA zone; fall back when the browser sent nothing usable. */
 export function safeZone(tz: string | undefined, fallback = process.env.AGENT_TZ || 'UTC'): string {
@@ -253,4 +256,49 @@ export function widen(w: DateWindow, step: number, today: string): DateWindow {
   const start = addDays(w.start, -pad);
   const end = addDays(w.end, pad) > today ? today : addDays(w.end, pad);
   return range(start, end);
+}
+
+/** Dates a model worked out for a message, in the shape TimeSchema asks for (see src/prompts.ts). */
+export type ModelTime = {
+  about: 'conversation' | 'world' | 'none';
+  phrase: string | null;
+  start: string | null;
+  end: string | null;
+  candidates: string[];
+  vague: boolean;
+  eventAnchored: boolean;
+  assumption: string | null;
+};
+
+const isDay = (d: unknown): d is string => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) && validYmd(+d.slice(0, 4), +d.slice(5, 7), +d.slice(8, 10));
+
+/**
+ * Check dates a model worked out and turn them into the same Resolved shape the rules produce, so every
+ * later step uses them exactly as it would use resolveDates' output. Rejects dates that are not real,
+ * a past conversation dated in the future, windows more than a year long or more than 3 years back, and
+ * candidate days far from the window.
+ */
+export function resolvedFromModel(m: ModelTime, today: string): { resolved: Resolved } | { problem: string } {
+  const { start, end } = m;
+  if (!isDay(start) || !isDay(end)) return { problem: `not real dates: ${start}..${end}` };
+  if (start > end) return { problem: `start ${start} is after end ${end}` };
+  const latest = m.about === 'conversation' ? today : addDays(today, 366);
+  if (end > latest) return { problem: `${end} is in the future` };
+  if (diffDays(today, start) > 3 * 366) return { problem: `${start} is more than 3 years back` };
+  if (diffDays(end, start) > 400) return { problem: `window ${start}..${end} is longer than a year` };
+  const candidates = [...new Set(m.candidates)];
+  for (const c of candidates) {
+    if (!isDay(c) || c > latest) return { problem: `bad candidate day ${c}` };
+    const near = (c >= start && c <= end) || Math.min(Math.abs(diffDays(c, start)), Math.abs(diffDays(c, end))) <= 31;
+    if (!near) return { problem: `candidate ${c} is far from the window` };
+  }
+  return {
+    resolved: {
+      window: { start, end, label: start === end ? dayLabel(start) : `${dayLabel(start)} to ${dayLabel(end)}` },
+      candidates: candidates.length ? candidates : start === end ? [start] : [],
+      vague: m.vague,
+      eventAnchored: m.eventAnchored,
+      ...(m.assumption ? { assumption: m.assumption } : {}),
+    },
+  };
 }

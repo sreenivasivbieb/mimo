@@ -1,6 +1,6 @@
 // The turn graph: code steps for time and memory around a router, research and one writer call.
 //
-//   ingest → resolve_dates (model reads the time phrase, rules calculate it) → recall → router ─┬─ smalltalk / memory_only / clarify / search ─→ synthesize
+//   ingest → resolve_dates (model works out the dates, code checks them, rules as fallback) → recall → router ─┬─ smalltalk / memory_only / clarify / search ─→ synthesize
 //                                             └─ recheck → searcher ×N (Send) → verdicts ──→ synthesize
 //   synthesize → guards → store (reply done) → extract_claims → END
 import { Annotation, END, Send, START, StateGraph, type LangGraphRunnableConfig } from '@langchain/langgraph';
@@ -14,12 +14,12 @@ import {
 import { recall as runRecall, terms, topicWords, type RecallMode } from './recall.js';
 import type { SearchProvider, SearchResult } from './search.js';
 import { claimId, normEntity, type Store } from './store.js';
-import { dayLabel, localDay, mayMentionTime, resolveDates } from './time.js';
+import { dayLabel, isMonthFirst, localDay, mayMentionTime, resolveDates, resolvedFromModel } from './time.js';
 import type { Claim, Emit, Finding, Flag, Recall, Resolved, Route, Source, Turn, VerdictRow } from './types.js';
 
 // ---------- per-run dependencies (not graph state) ----------
 
-export const LIMITS = { maxFanout: 8, searcherTimeoutMs: 90_000, searcherRounds: 3, writerRounds: 4, historyTurns: 12, routerContextTurns: 4 };
+export const LIMITS = { timeReadMs: 4_000, maxFanout: 8, searcherTimeoutMs: 90_000, searcherRounds: 3, writerRounds: 4, historyTurns: 12, routerContextTurns: 4 };
 
 /** Assigns S# IDs across parallel searchers and dedupes by URL. */
 export class SourceRegistry {
@@ -68,6 +68,7 @@ export const State = Annotation.Root({
   resolved: Annotation<Resolved>(),
   timeFrom: Annotation<'model' | 'rules'>(), // who read the time phrase
   timeAbout: Annotation<'conversation' | 'world' | 'none' | undefined>(), // set only when the model read it
+  timePhrase: Annotation<string | undefined>(), // the words that named the time, when the model found them
   recallMode: Annotation<RecallMode | null>(),
   askDate: Annotation<boolean>(), // a memory question with no date and several days to choose from
   recalled: Annotation<Recall>(),
@@ -104,7 +105,7 @@ const ABSENCE = new RegExp(`^\\s*(did|have|had)\\s+(i|we|you)\\s+(ever\\s+|alrea
 // A reply that talks about our past conversation without citing a recalled turn is making it up.
 const CLAIMS_PAST = /\b(we|you|i)\s+(might|may|probably|likely|must|could)?\s*(have\s+)?(already\s+|previously\s+|earlier\s+)?(discussed|talked|asked|researched|searched|mentioned|said|covered|looked up)\b/i;
 // "Is your answer still correct?", "has any of them changed pricing since?", "shipped anything big since then?"
-const RECHECK = /\b(still (correct|true|valid|accurate|right|current|the case|the same|hold|holds|apply|applies|good)|(gone|went) (up|down)|(anything|what('s| has)?) (changed|new)|any (changes|updates)|re-?check|up to date|out of date)\b|\b(chang|updat|ship|launch|releas|rais|increas|drop|cut)\w*\b.{0,80}\bsince\b|\bsince\b.{0,80}\b(chang|updat|ship|launch|releas)\w*/i;
+const RECHECK = /\b(still (correct|true|valid|accurate|right|current|the case|the same|hold|holds|apply|applies|good)|(gone|went) (up|down)|\b(?:has|have|did)\b.{0,60}\bchang(?:e|ed|es)\b|(anything|what('s| has)?) (changed|new)|any (changes|updates)|re-?check|up to date|out of date)\b|\b(chang|updat|ship|launch|releas|rais|increas|drop|cut)\w*\b.{0,80}\bsince\b|\bsince\b.{0,80}\b(chang|updat|ship|launch|releas)\w*/i;
 // Words that only say "has it changed?" — on a recheck question they are not the topic to recall
 // ("is it still accurate?" is not a search for turns that mention "accurate").
 const RECHECK_WORDS = /\b(still|correct|true|valid|accurate|right|current|case|same|holds?|appl(y|ies)|good|chang\w*|updat\w*|ship\w*|launch\w*|releas\w*|rais\w*|increas\w*|drop\w*|cut|since|then|gone|went|up|down|new|big|date|re-?check|pric(e|es|ing))\b/gi;
@@ -198,14 +199,19 @@ function ingest(s: S): U {
 
 const NO_TIME: Resolved = { window: null, candidates: [], vague: false, eventAnchored: false };
 const squash = (x: string) => x.toLowerCase().replace(/[’']/g, "'").replace(/\s+/g, ' ').trim();
+const span = (r: Resolved) => (r.window ? `${r.window.start}..${r.window.end}` : 'none');
 
 /**
- * The model reads, the rules calculate. A fast model copies out the words in the message that name a
- * time (it never produces a date) and says whether they are about our conversation or about the world;
- * resolveDates turns those words into a window. That keeps "monday.com", "after 3.11" and "the 3 November
- * launch" from being read as dates. If the model fails, or returns words that are not in the message or
- * that the rules cannot resolve, the rules run on the whole message, as they always did.
- * Greetings and obvious memory questions are read by the rules alone, with no model call.
+ * Time is worked out by a fast model and checked by code. The model gets today's date (the user's
+ * calendar day), their time zone and date order, and returns the exact dates the message refers to, in
+ * the same shape resolveDates produces (window, candidate days, vague, assumption), so every later step
+ * uses them unchanged. Then code:
+ *  - rejects dates that are not real, a past conversation in the future, or anything far off;
+ *  - recomputes the dates with the rules from the model's own phrase when the rules understand it, and
+ *    keeps the rules' dates if the two disagree (date arithmetic stays checkable);
+ *  - runs the rules on the whole message if the model fails, takes longer than LIMITS.timeReadMs,
+ *    returns words that are not in the message, or returns dates that fail the checks.
+ * Greetings, messages with no time words, and memory questions whose date the rules already read skip the model.
  */
 async function resolve_dates(s: S, config: LangGraphRunnableConfig): Promise<U> {
   const ctx = ctxOf(config);
@@ -213,40 +219,58 @@ async function resolve_dates(s: S, config: LangGraphRunnableConfig): Promise<U> 
   const today = s.turn.localDay;
   const rules = resolveDates(text, today, s.locale);
   const byRules = (why: string): U => {
-    ctx.log?.(`[time] rules (${why}) window=${rules.window ? `${rules.window.start}..${rules.window.end}` : 'none'}`);
+    ctx.log?.(`[time] rules (${why}) window=${span(rules)}`);
     return { resolved: rules, timeFrom: 'rules' };
   };
-  if (SMALLTALK.test(text) || isMemoryQuestion(text)) return byRules('no model needed');
+  if (SMALLTALK.test(text)) return byRules('greeting');
   if (!mayMentionTime(text) && !rules.window) return byRules('no time words');
+  if (isMemoryQuestion(text) && (rules.window || !mayMentionTime(text, true))) return byRules('memory question the rules can read, or with no date in it');
 
   const t0 = Date.now();
   try {
     const last = (await ctx.store.turns(s.turn.convId)).filter((t) => t.id !== s.turn.id && t.status === 'complete').at(-1);
     const prompt = [
+      `Today: ${dayLabel(today)} (${today}), time zone ${s.turn.tz}. This user writes numeric dates ${isMonthFirst(s.locale) ? 'month-first (3/11 = 11 March)' : 'day-first (3/11 = 3 November)'}.`,
       last ? `Previous exchange (context for short replies):\nUser: ${last.user.slice(0, 200)}\nAssistant: ${(last.assistant ?? '').replace(/\s+/g, ' ').slice(0, 200)}` : '',
       `Message:\n${text}`,
     ].filter(Boolean).join('\n\n');
-    const { value, usage } = await ctx.model.structured({ tier: 'fast', system: TIME_SYSTEM, prompt, schema: TimeSchema, signal: ctx.signal });
+    // Its own short deadline: a slow or overloaded model must fall back to the rules, not hold up the turn.
+    const signal = AbortSignal.any([AbortSignal.timeout(LIMITS.timeReadMs), ...(ctx.signal ? [ctx.signal] : [])]);
+    const { value, usage } = await ctx.model.structured({ tier: 'time', system: TIME_SYSTEM, prompt, schema: TimeSchema, signal });
     logUsage(ctx, 'time', t0, usage);
+
     const phrase = value.phrase?.trim();
     if (value.about === 'none' || !phrase) {
-      ctx.log?.(`[time] model: no time reference (rules would have said ${rules.window ? `${rules.window.start}..${rules.window.end}` : 'none'})`);
+      ctx.log?.(`[time] model: no time reference (rules alone would have said ${span(rules)})`);
       return { resolved: NO_TIME, timeFrom: 'model', timeAbout: 'none' };
     }
     if (!squash(text).includes(squash(phrase))) return byRules(`model phrase "${phrase}" is not in the message`);
-    const read = resolveDates(phrase, today, s.locale);
-    if (!read.window) return byRules(`rules cannot resolve the model's phrase "${phrase}"`);
-    ctx.log?.(`[time] model: "${phrase}" (${value.about}) → ${read.window.start}..${read.window.end}`);
-    return { resolved: read, timeFrom: 'model', timeAbout: value.about };
+    const checked = resolvedFromModel({ ...value, phrase }, today);
+    if ('problem' in checked) return byRules(`model dates rejected: ${checked.problem}`);
+
+    // Check the model's arithmetic with the rules wherever the rules understand the same words.
+    const fromPhrase = resolveDates(phrase, today, s.locale);
+    if (fromPhrase.window && span(fromPhrase) !== span(checked.resolved)) {
+      ctx.log?.(`[time] model said ${span(checked.resolved)} for "${phrase}", rules say ${span(fromPhrase)}: using the rules' dates`);
+      return { resolved: fromPhrase, timeFrom: 'rules', timeAbout: value.about, timePhrase: phrase };
+    }
+    ctx.log?.(`[time] model: "${phrase}" (${value.about}) → ${span(checked.resolved)} [${checked.resolved.candidates.join(', ')}]${fromPhrase.window ? ', rules agree' : ', rules cannot read this phrase'}`);
+    return { resolved: checked.resolved, timeFrom: 'model', timeAbout: value.about, timePhrase: phrase };
   } catch (e) {
-    if (ctx.signal?.aborted) throw e;
-    return byRules(`model failed: ${(e as Error).message}`);
+    if (ctx.signal?.aborted) throw e; // the user's turn was cancelled: stop, don't fall back
+    return byRules(`model failed after ${Date.now() - t0} ms: ${(e as Error).message}`);
   }
 }
 
 const isMemoryQuestion = (t: string) => ABSENCE.test(t) || ASK_HISTORY.test(t);
-/** The part of a message that names what to recall: recheck vocabulary removed from recheck questions. */
-const topicText = (t: string) => (RECHECK.test(t) ? t.replace(RECHECK_WORDS, ' ') : t);
+/**
+ * The part of a message that names what to recall: the time phrase removed ("two Tuesdays ago" is when,
+ * not what), and recheck vocabulary removed from recheck questions.
+ */
+const topicText = (t: string, timePhrase?: string) => {
+  const noTime = timePhrase ? t.replace(new RegExp(timePhrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig'), ' ') : t;
+  return RECHECK.test(noTime) ? noTime.replace(RECHECK_WORDS, ' ') : noTime;
+};
 
 async function recall(s: S, config: LangGraphRunnableConfig): Promise<U> {
   const ctx = ctxOf(config);
@@ -268,7 +292,7 @@ async function recall(s: S, config: LangGraphRunnableConfig): Promise<U> {
 
   let mode: RecallMode | null = null;
   let askDate = false;
-  const query = topicText(text);
+  const query = topicText(text, s.timePhrase);
   const topic = terms(query).length > 0;
   if (isMemoryQuestion(text) && !resolved.window && !topic) {
     // "What did we talk about before?": no date, no topic. One day of history → use it; several → ask which.
@@ -490,7 +514,7 @@ async function synthesize(s: S, config: LangGraphRunnableConfig): Promise<U> {
   };
 
   // Abstention gate: a memory question with nothing recalled gets a fixed reply, no model call.
-  const noRecord = () => noRecordReply(s.recalled, s.turn.localDay, s.resolved.window?.label, s.recallMode === 'absence' ? topicWords(topicText(s.turn.user)).join(' ') : undefined, Boolean(s.turn.userId));
+  const noRecord = () => noRecordReply(s.recalled, s.turn.localDay, s.resolved.window?.label, s.recallMode === 'absence' ? topicWords(topicText(s.turn.user, s.timePhrase)).join(' ') : undefined, Boolean(s.turn.userId));
   // "Which day?": asked by code, listing the days and conversations we have, so the reply is always grounded.
   if (s.route === 'clarify' && (s.askDate || (s.recallMode === 'day' && s.recalled.status === 'ask'))) {
     const answer = whichDayReply(s.askDate ? ctx.pool : s.recalled.hits.map((h) => h.turn), s.turn.localDay);
