@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mimo</title>
+<style>
+  :root {
+    --bg: #faf9f7; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --line: #e6e4e0;
+    --accent: #3b5bdb; --user: #eef1fb; --warn-bg: #fff6e0; --warn: #8a5a00; --err: #b42318;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151517; --panel: #1d1d20; --text: #ececee; --muted: #9a9aa2; --line: #2e2e33;
+      --accent: #8ea2ff; --user: #23263a; --warn-bg: #2f2716; --warn: #f0c36a; --err: #ff8a80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; background: var(--bg); border-bottom: 1px solid var(--line); z-index: 1; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+  header small { color: var(--muted); margin-left: 8px; }
+  button { font: inherit; cursor: pointer; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 8px; padding: 6px 12px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px 16px 140px; }
+  .turn { margin: 18px 0; }
+  .user { background: var(--user); padding: 10px 14px; border-radius: 12px; white-space: pre-wrap; margin-left: auto; max-width: 85%; width: fit-content; }
+  .meta { color: var(--muted); font-size: 12px; margin: 4px 2px; }
+  .bot { background: var(--panel); border: 1px solid var(--line); padding: 12px 16px; border-radius: 12px; margin-top: 8px; overflow-x: auto; }
+  .bot p { margin: .5em 0; } .bot ul, .bot ol { margin: .4em 0; padding-left: 1.3em; }
+  .bot table { border-collapse: collapse; margin: .6em 0; font-size: 14px; }
+  .bot th, .bot td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; }
+  .bot a { color: var(--accent); text-decoration: none; }
+  .bot a.cite { font-size: 11px; vertical-align: super; padding: 0 2px; }
+  .bot blockquote { margin: .6em 0; padding: 6px 10px; background: var(--warn-bg); color: var(--warn); border-radius: 6px; }
+  .bot code { background: var(--user); padding: 0 4px; border-radius: 4px; }
+  .status { color: var(--muted); font-size: 13px; }
+  .status div::before { content: "› "; }
+  .sources { margin-top: 8px; font-size: 13px; color: var(--muted); }
+  .sources summary { cursor: pointer; }
+  .sources li { margin: 2px 0; overflow-wrap: anywhere; }
+  .note { background: var(--warn-bg); color: var(--warn); padding: 6px 10px; border-radius: 6px; font-size: 13px; margin-top: 8px; }
+  .error { color: var(--err); font-size: 14px; margin-top: 8px; }
+  .error button { margin-left: 8px; padding: 2px 8px; }
+  form { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg); border-top: 1px solid var(--line); padding: 12px 16px; }
+  form .row { max-width: 760px; margin: 0 auto; display: flex; gap: 8px; }
+  textarea { flex: 1; resize: none; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-height: 46px; max-height: 160px; }
+  .empty { color: var(--muted); text-align: center; margin-top: 18vh; }
+  .flash { outline: 2px solid var(--accent); border-radius: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div><h1 style="display:inline">Mimo</h1><small id="zone"></small></div>
+  <button id="new">New chat</button>
+</header>
+<main id="log"><p class="empty" id="empty">Ask anything. I search the web, cite sources, and remember what we talked about and when.</p></main>
+<form id="f">
+  <div class="row">
+    <textarea id="q" rows="1" placeholder="Message Mimo… (Enter to send, Shift+Enter for a new line)"></textarea>
+    <button class="primary" id="send">Send</button>
+  </div>
+</form>
+<script>
+const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const locale = navigator.language || 'en-US';
+const $ = (id) => document.getElementById(id);
+$('zone').textContent = tz;
+
+const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
+const params = new URLSearchParams(location.search);
+let convId = params.get('conv') || store.get('mimo.conv') || uid();
+store.set('mimo.conv', convId);
+// One ID per browser groups all of this person's chats, so memory questions can reach earlier chats.
+const userId = params.get('user') || store.get('mimo.user') || uid();
+store.set('mimo.user', userId);
+// Every chat this browser has used, sent along so the server can attach older chats to this user.
+const knownConvs = () => { try { return JSON.parse(store.get('mimo.convs') || '[]'); } catch { return []; } };
+const rememberConv = (id) => store.set('mimo.convs', JSON.stringify([id, ...knownConvs().filter((c) => c !== id)].slice(0, 50)));
+rememberConv(convId);
+let current = null; // { controller }
+
+// ---- tiny markdown: escape first, then links, bold, code, lists, tables, quotes ----
+const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function inline(s) {
+  return esc(s)
+    .replace(/\[([^\]]+)\]\(((?:https?:\/\/|#turn-|\/\?conv=)[^)\s]+)\)/g, (_, t, u) => {
+      const cite = /^(\d+|↩.*)$/.test(t);
+      // A link into another chat keeps the ?user= override (demo), placed before the #turn anchor.
+      if (u.startsWith('/?conv=') && params.get('user')) u = u.replace(/(#|$)/, '&user=' + encodeURIComponent(params.get('user')) + '$1');
+      const ext = u.startsWith('http');
+      return `<a ${cite ? 'class="cite"' : ''} href="${u}" ${ext ? 'target="_blank" rel="noopener"' : ''}>${cite && !t.startsWith('↩') ? `[${t}]` : t}</a>`;
+    })
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
+}
+function md(src) {
+  const lines = src.split('\n'); const out = []; let i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      const row = (r) => r.trim().replace(/^\||\|$/g, '').split(/(?<!\\)\|/).map((c) => inline(c.trim().replace(/\\\|/g, '|')));
+      let html = '<table><tr>' + row(l).map((c) => `<th>${c}</th>`).join('') + '</tr>'; i += 2;
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) { html += '<tr>' + row(lines[i]).map((c) => `<td>${c}</td>`).join('') + '</tr>'; i++; }
+      out.push(html + '</table>'); continue;
+    }
+    if (/^\s*([-*]|\d+\.)\s+/.test(l)) {
+      const ordered = /^\s*\d+\./.test(l); let html = ordered ? '<ol>' : '<ul>';
+      while (i < lines.length && /^\s*([-*]|\d+\.)\s+/.test(lines[i])) { html += `<li>${inline(lines[i].replace(/^\s*([-*]|\d+\.)\s+/, ''))}</li>`; i++; }
+      out.push(html + (ordered ? '</ol>' : '</ul>')); continue;
+    }
+    if (/^>\s?/.test(l)) { out.push(`<blockquote>${inline(l.replace(/^>\s?/, ''))}</blockquote>`); i++; continue; }
+    const h = l.match(/^(#{1,4})\s+(.*)/);
+    if (h) { out.push(`<p><strong>${inline(h[2])}</strong></p>`); i++; continue; }
+    if (!l.trim()) { i++; continue; }
+    let para = l; i++;
+    while (i < lines.length && lines[i].trim() && !/^\s*([-*]|\d+\.|\||>|#)/.test(lines[i])) para += '\n' + lines[i++];
+    out.push(`<p>${inline(para).replace(/\n/g, '<br>')}</p>`);
+  }
+  return out.join('');
+}
+
+function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
+const fmtTime = (iso) => new Date(iso).toLocaleString(locale, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+function addTurn(text, ts, id) {
+  $('empty')?.remove();
+  const wrap = el('section', 'turn'); if (id) wrap.id = 'turn-' + id;
+  wrap.append(el('div', 'meta', fmtTime(ts || new Date().toISOString())), el('div', 'user'));
+  wrap.querySelector('.user').textContent = text;
+  const bot = el('div', 'bot');
+  const status = el('div', 'status'); const body = el('div'); const sources = el('div');
+  bot.append(status, body, sources); wrap.append(bot);
+  $('log').append(wrap);
+  return { wrap, bot, status, body, sources, raw: '', srcs: new Map() };
+}
+
+function renderSources(view) {
+  if (!view.srcs.size) { view.sources.innerHTML = ''; return; }
+  const items = [...view.srcs.values()].map((s) => `<li>[${esc(s.id.slice(1))}] <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title || s.url)}</a>${s.pageDate ? ` · ${esc(s.pageDate)}` : ' · undated'}</li>`).join('');
+  view.sources.innerHTML = `<details class="sources"><summary>${view.srcs.size} source${view.srcs.size > 1 ? 's' : ''}</summary><ul>${items}</ul></details>`;
+}
+
+async function send(text, turnId, view) {
+  if (current) current.controller.abort(); // the server also aborts the older run
+  const controller = new AbortController(); current = { controller };
+  view.wrap.id = 'turn-' + turnId;
+  view.body.innerHTML = ''; view.raw = ''; view.status.innerHTML = '';
+  view.bot.querySelectorAll('.error,.note').forEach((n) => n.remove());
+  let finished = false;
+  try {
+    const res = await fetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ convId, userId, knownConvs: knownConvs(), turnId, text, tz, locale }), signal: controller.signal });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+    const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        const data = chunk.split('\n').find((l) => l.startsWith('data: '));
+        if (!data) continue;
+        const e = JSON.parse(data.slice(6));
+        if (e.type === 'status') view.status.append(el('div', '', esc(e.text)));
+        else if (e.type === 'sources') { e.sources.forEach((s) => view.srcs.set(s.url, s)); renderSources(view); }
+        else if (e.type === 'token') { view.raw += e.text; view.body.innerHTML = md(view.raw); }
+        else if (e.type === 'note') view.bot.append(el('div', 'note', esc(e.text)));
+        else if (e.type === 'done') { finished = true; view.status.innerHTML = ''; }
+        else if (e.type === 'error') { finished = true; showError(view, e.message, text, turnId); }
+      }
+      window.scrollTo(0, document.body.scrollHeight);
+    }
+    if (!finished) showError(view, 'The connection dropped before the answer finished.', text, turnId);
+  } catch (err) {
+    if (err.name !== 'AbortError') showError(view, err.message, text, turnId);
+  } finally {
+    if (current?.controller === controller) current = null;
+  }
+}
+
+function showError(view, message, text, turnId) {
+  view.status.innerHTML = '';
+  const e = el('div', 'error', esc(message));
+  const retry = el('button', '', 'Retry');
+  retry.onclick = () => send(text, turnId, view); // same turn ID: the server returns the stored result if it has one
+  e.append(retry); view.bot.append(e);
+}
+
+async function loadHistory() {
+  try {
+    const res = await fetch('/api/history?convId=' + encodeURIComponent(convId));
+    const { turns } = await res.json();
+    for (const t of turns) {
+      const v = addTurn(t.user, t.ts, t.id);
+      if (t.status === 'complete') { v.body.innerHTML = md(t.assistant || ''); t.sources.forEach((s) => v.srcs.set(s.url, s)); renderSources(v); }
+      else v.bot.append(el('div', 'error', t.status === 'cancelled' ? 'Stopped: replaced by a newer message.' : 'This answer did not finish.'));
+    }
+    // Opened from a link to a turn in this chat: scroll to it and highlight it.
+    const target = location.hash.startsWith('#turn-') && document.querySelector(location.hash);
+    if (target) { target.scrollIntoView({ block: 'center' }); target.classList.add('flash'); setTimeout(() => target.classList.remove('flash'), 2000); }
+    else window.scrollTo(0, document.body.scrollHeight);
+  } catch {}
+}
+
+$('f').onsubmit = (ev) => {
+  ev.preventDefault();
+  const text = $('q').value.trim(); if (!text) return;
+  $('q').value = ''; $('q').style.height = '';
+  send(text, uid(), addTurn(text));
+};
+$('q').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('f').requestSubmit(); } });
+$('q').addEventListener('input', (e) => { e.target.style.height = ''; e.target.style.height = Math.min(e.target.scrollHeight, 160) + 'px'; });
+$('new').onclick = () => { if (current) current.controller.abort(); convId = uid(); store.set('mimo.conv', convId); rememberConv(convId); $('log').innerHTML = ''; const p = el('p', 'empty', 'New conversation.'); p.id = 'empty'; $('log').append(p); };
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a[href^="#turn-"]'); if (!a) return;
+  e.preventDefault(); const t = document.querySelector(a.getAttribute('href'));
+  if (t) { t.scrollIntoView({ behavior: 'smooth', block: 'center' }); t.classList.add('flash'); setTimeout(() => t.classList.remove('flash'), 1500); }
+});
+loadHistory();
+</script>
+</body>
+</html>

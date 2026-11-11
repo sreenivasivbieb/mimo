@@ -1,0 +1,33 @@
+flowchart LR
+  subgraph browser["Browser"]
+    ui["<b>public/index.html</b><br/>chat page · sends time zone + locale<br/>renders citations and sources"]
+  end
+
+  subgraph server["Node server · npm run dev"]
+    http["<b>server.ts</b><br/>POST /api/chat → SSE stream<br/>GET /api/history"]
+    runs["<b>run registry</b><br/>idempotent turn IDs<br/>new message aborts the old run"]
+    turngraph["<b>graph.ts</b><br/>LangGraph turn graph"]
+    logic["<b>time.ts · recall.ts · guards.ts</b><br/>dates, memory, checks<br/>(plain code, no model)"]
+    models["<b>models.ts</b><br/>Groq adapter + key rotator<br/>token budget · Anthropic optional"]
+    search["<b>search.ts</b><br/>Tavily (Brave optional)<br/>10-min cache, retries"]
+    store["<b>store.ts</b><br/>PgStore"]
+  end
+
+  groq[("Groq API<br/>gpt-oss-20b · gpt-oss-120b")]
+  tavily[("Tavily API")]
+  pg[("Postgres · Docker<br/>turns · claims")]
+
+  ui -- "message + turn ID" --> http
+  http -- "status · sources · token · note · done" --> ui
+  http --> runs --> turngraph
+  turngraph --> logic
+  turngraph --> models --> groq
+  turngraph --> search --> tavily
+  turngraph --> store --> pg
+
+  classDef code fill:#f4f4f5,stroke:#71717a,color:#18181b
+  classDef model fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+  classDef data fill:#ffedd5,stroke:#ea580c,color:#7c2d12
+  class http,runs,turngraph,logic,search,store code
+  class models model
+  class groq,tavily,pg data

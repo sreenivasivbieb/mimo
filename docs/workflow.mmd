@@ -1,0 +1,34 @@
+flowchart TD
+  msg(["User message<br/>+ turn ID · time zone · locale"]) --> ingest
+
+  ingest["<b>ingest</b> · code<br/>server timestamp + sequence<br/>user's local calendar day"] --> resolve
+  resolve["<b>resolve_dates</b> · code<br/>'since Monday' · '3/11' · 'last Tuesday'<br/>→ date window + candidate days"] --> recall
+  recall["<b>recall</b> · code<br/>reads this user's earlier chats (Postgres)<br/>exact day lookup or topic ranking<br/>widens the window up to 3×"] --> router
+
+  router{"<b>router</b><br/>regex pre-checks,<br/>else fast model"}
+  router -- "smalltalk · clarify · search" --> synth
+  router -- "memory_only" --> when{"date<br/>given?"}
+  when -- "no, several days" --> whichday["<b>which day?</b> · code<br/>lists days + chats we have;<br/>the reply's date is applied<br/>to the original question"]
+  when -- "yes / one day / topic" --> gate{"anything<br/>recalled?"}
+  gate -- "yes" --> synth
+  gate -- "no" --> norecord["<b>abstention gate</b> · code<br/>fixed 'no record' reply<br/>lists the days we have"]
+  router -- "recheck" --> fan{"how many<br/>entities?"}
+  fan -- "≤ 3" --> one["<b>searcher</b> ×1<br/>one call covers all entities<br/>calls web_search (Tavily)"]
+  fan -- "> 3" --> many["<b>searcher</b> ×N<br/>LangGraph Send fan-out<br/>calls web_search (Tavily)"]
+  one --> verdicts
+  many --> verdicts
+  verdicts["<b>verdicts</b><br/>model proposes held / changed /<br/>corrected / could-not-verify,<br/>code checks every one"] --> synth
+
+  synth["<b>synthesize</b><br/>one writer call, streamed to the browser<br/>search route calls web_search itself"] --> guards
+  norecord --> guards
+  whichday --> guards
+  guards["<b>guards</b> · code<br/>citations → links · number check<br/>budget and downgrade notes"] --> store
+  store["<b>store</b> · code<br/>writes the finished turn to Postgres"] --> done(["SSE 'done'<br/>reply complete"])
+  store --> extract["<b>extract_claims</b><br/>facts for future rechecks → Postgres<br/>(after the reply is shown)"]
+
+  classDef code fill:#f4f4f5,stroke:#71717a,color:#18181b
+  classDef model fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+  classDef edge fill:#ecfdf5,stroke:#059669,color:#064e3b
+  class ingest,resolve,recall,guards,store,gate,fan,norecord,when,whichday code
+  class router,one,many,verdicts,synth,extract model
+  class msg,done edge
